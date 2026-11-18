@@ -8,7 +8,7 @@ Pinned: `telegramdesktop/tdesktop` **v6.9.4** (`8a22f2c106dd3c601e11d124b8d18946
 | Cheez | Desktop me |
 |---|---|
 | `FightModeDsp.h` (gain, EQ, clarity, broadcast) | Same file, sidha reuse (`tests/dsp` ab bhi pass) |
-| tgcalls audio hook | Naya port: desktop tgcalls me `AudioCapturePostProcessor` `GroupInstanceCustomImpl.cpp` ke andar hai, isliye `0002-fight-mode-desktop-tgcalls.patch` alag hai |
+| tgcalls/audio hooks | Group calls aur 1-to-1 calls ke WebRTC capture path ke saath voice-message recording ke desktop capture path par bhi Fight Mode DSP lagta hai |
 | UI | Naya neon Qt panel (Lord Carry setup jaisa look): left side menu -> **Fight mode**. VB-Cable / device routing **nahi** hai, kyunki Telegram ke andar hi mic process hota hai |
 | Menu entry | Left side menu (hamburger) me **Fight mode** (Calls ke neeche), call ke bina bhi khulta hai. Fight mode ON ho to naam ke saath ek dot **blink** karta hai. Voice chat ke 3-dot menu me Fight mode **nahi** hai: sirf side menu se hi on/off hota hai |
 | 20 accounts | `kMaxAccounts` / `kPremiumMaxAccounts` = 20 |
