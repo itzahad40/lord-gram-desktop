@@ -45,6 +45,18 @@ jobs:
       - name: Read SDK version
         shell: bash
         run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          prepare = Path(os.environ["GITHUB_WORKSPACE"]) / "TBuild" / "tdesktop" / "Telegram" / "build" / "prepare" / "prepare.py"
+          text = prepare.read_text(encoding="utf-8")
+          old = "mingw-w64-x86_64-diffutils"
+          if old not in text:
+              raise SystemExit(f"Expected obsolete MSYS2 package name not found in {prepare}")
+          prepare.write_text(text.replace(old, "diffutils", 1), encoding="utf-8")
+          print("Replaced obsolete MSYS2 package mingw-w64-x86_64-diffutils with diffutils")
+          PY
           DOCPATH=$GITHUB_WORKSPACE/TBuild/tdesktop/docs/building-win.md
           SDK="$(grep "SDK version" $DOCPATH | sed -r 's/.*\*\*(.*)\*\* SDK version.*/\1/')"
           echo "SDK=$SDK" >> $GITHUB_ENV
