@@ -1,0 +1,2039 @@
+diff --git a/TMessagesProj/jni/tgnet/ConnectionsManager.cpp b/TMessagesProj/jni/tgnet/ConnectionsManager.cpp
+index 0049402..0f1d76d 100644
+--- a/TMessagesProj/jni/tgnet/ConnectionsManager.cpp
++++ b/TMessagesProj/jni/tgnet/ConnectionsManager.cpp
+@@ -6,6 +6,7 @@
+  * Copyright Nikolai Kudashov, 2015-2018.
+  */
+ 
++#include <mutex>
+ #include <cassert>
+ #include <cstdlib>
+ #include <sys/eventfd.h>
+@@ -137,24 +138,17 @@ ConnectionsManager::~ConnectionsManager() {
+ }
+ 
+ ConnectionsManager& ConnectionsManager::getInstance(int32_t instanceNum) {
+-    switch (instanceNum) {
+-        case 0:
+-            static ConnectionsManager instance0(0);
+-            return instance0;
+-        case 1:
+-            static ConnectionsManager instance1(1);
+-            return instance1;
+-        case 2:
+-            static ConnectionsManager instance2(2);
+-            return instance2;
+-        case 3:
+-            static ConnectionsManager instance3(3);
+-            return instance3;
+-        case 4:
+-        default:
+-            static ConnectionsManager instance4(4);
+-            return instance4;
++    // Lord Gram: one lazily created manager per account, up to MAX_ACCOUNT_COUNT
++    static std::mutex instancesLock;
++    static ConnectionsManager *instances[MAX_ACCOUNT_COUNT] = {nullptr};
++    if (instanceNum < 0 || instanceNum >= MAX_ACCOUNT_COUNT) {
++        instanceNum = MAX_ACCOUNT_COUNT - 1;
+     }
++    std::lock_guard<std::mutex> guard(instancesLock);
++    if (instances[instanceNum] == nullptr) {
++        instances[instanceNum] = new ConnectionsManager(instanceNum);
++    }
++    return *instances[instanceNum];
+ }
+ 
+ int ConnectionsManager::callEvents(int64_t now) {
+diff --git a/TMessagesProj/jni/tgnet/Defines.h b/TMessagesProj/jni/tgnet/Defines.h
+index 36f86bb..6eff734 100644
+--- a/TMessagesProj/jni/tgnet/Defines.h
++++ b/TMessagesProj/jni/tgnet/Defines.h
+@@ -27,7 +27,7 @@
+ #define DOWNLOAD_CONNECTIONS_COUNT 8
+ #define UPLOAD_CONNECTIONS_COUNT 4
+ #define CONNECTION_BACKGROUND_KEEP_TIME 10000
+-#define MAX_ACCOUNT_COUNT 5
++#define MAX_ACCOUNT_COUNT 20
+ #define USE_DELEGATE_HOST_RESOLVE
+ 
+ #define USE_IPV4_ONLY 0
+diff --git a/TMessagesProj/jni/voip/org_telegram_messenger_voip_Instance.cpp b/TMessagesProj/jni/voip/org_telegram_messenger_voip_Instance.cpp
+index a5a0d3f..1e1ac35 100644
+--- a/TMessagesProj/jni/voip/org_telegram_messenger_voip_Instance.cpp
++++ b/TMessagesProj/jni/voip/org_telegram_messenger_voip_Instance.cpp
+@@ -756,6 +756,28 @@ JNIEXPORT void JNICALL Java_org_telegram_messenger_voip_NativeInstance_setNoiseS
+     instance->groupNativeInstance->setIsNoiseSuppressionEnabled(enabled);
+ }
+ 
++extern "C"
++JNIEXPORT void JNICALL Java_org_telegram_messenger_voip_NativeInstance_setFightMode(JNIEnv *env, jobject obj, jboolean enabled, jfloat gainDb, jfloat volume, jfloatArray eq) {
++    InstanceHolder *instance = getInstanceHolder(env, obj);
++    if (instance->groupNativeInstance == nullptr) {
++        return;
++    }
++    std::vector<float> bands(9, 0.0f); // 6 EQ bands, clarity, punch, broadcast (0/1)
++    if (eq != nullptr) {
++        jsize len = env->GetArrayLength(eq);
++        if (len > 9) {
++            len = 9;
++        }
++        env->GetFloatArrayRegion(eq, 0, len, bands.data());
++    }
++    instance->groupNativeInstance->setFightMode(enabled, gainDb, volume, std::move(bands));
++}
++
++extern "C"
++JNIEXPORT jfloat JNICALL Java_org_telegram_messenger_voip_NativeInstance_getFightModeLevel(JNIEnv *env, jobject obj) {
++    return GroupInstanceCustomImpl::getFightModeLevel();
++}
++
+ 
+ extern "C"
+ JNIEXPORT jlong JNICALL Java_org_telegram_messenger_voip_NativeInstance_addIncomingVideoOutput(JNIEnv *env, jobject obj, jint quality, jstring endpointId, jobjectArray ssrcGroups, jobject remoteSink, jlong userId) {
+diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/UserConfig.java b/TMessagesProj/src/main/java/org/telegram/messenger/UserConfig.java
+index 0f79e44..09b7c27 100644
+--- a/TMessagesProj/src/main/java/org/telegram/messenger/UserConfig.java
++++ b/TMessagesProj/src/main/java/org/telegram/messenger/UserConfig.java
+@@ -24,8 +24,9 @@ import java.util.Arrays;
+ public class UserConfig extends BaseController {
+ 
+     public static int selectedAccount;
+-    public final static int MAX_ACCOUNT_DEFAULT_COUNT = 3;
+-    public final static int MAX_ACCOUNT_COUNT = 4;
++    // Lord Gram: many accounts (must match MAX_ACCOUNT_COUNT in jni/tgnet/Defines.h)
++    public final static int MAX_ACCOUNT_DEFAULT_COUNT = 20;
++    public final static int MAX_ACCOUNT_COUNT = 20;
+ 
+     private final Object sync = new Object();
+     private volatile boolean configLoaded;
+@@ -122,7 +123,7 @@ public class UserConfig extends BaseController {
+     }
+ 
+     public static int getMaxAccountCount() {
+-        return hasPremiumOnAccounts() ? 5 : 3;
++        return MAX_ACCOUNT_COUNT; // Lord Gram: no premium needed for more accounts
+     }
+ 
+     public int getNewMessageId() {
+diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/voip/FightMode.java b/TMessagesProj/src/main/java/org/telegram/messenger/voip/FightMode.java
+new file mode 100644
+index 0000000..2ad960f
+--- /dev/null
++++ b/TMessagesProj/src/main/java/org/telegram/messenger/voip/FightMode.java
+@@ -0,0 +1,167 @@
++package org.telegram.messenger.voip;
++
++import android.content.Context;
++import android.content.SharedPreferences;
++
++import org.telegram.messenger.ApplicationLoader;
++import org.webrtc.voiceengine.WebRtcAudioRecord;
++
++/**
++ * Lord Gram: settings of "Fight mode" (loud, clear PA-style microphone). Persisted across app restarts.
++ * Whether fight mode is currently ON lives in {@link VoIPService}, so it always starts OFF in a new call.
++ */
++public final class FightMode {
++
++    public static final int BANDS = 6;
++    public static final int[] EQ_FREQ = {60, 400, 1000, 2500, 6300, 16000};
++    public static final float MAX_GAIN_DB = 100f;
++    public static final float MAX_EQ_DB = 12f;
++
++    public static final String[] PRESET_NAMES = {
++            "Flat", "Easy Listening", "Voice", "Bass Boost", "Treble Boost", "Rock",
++            "Pop", "Dance", "Hip Hop", "Jazz", "Classical", "Heavy Metal", "Megaphone"};
++    public static final float[][] PRESETS = {
++            {0, 0, 0, 0, 0, 0},
++            {3, -3, 0, 3, 0, 6},
++            {-6, -3, 2, 5, 3, 0},
++            {8, 5, 0, 0, 0, 0},
++            {0, 0, 0, 4, 7, 9},
++            {5, 3, -2, 2, 4, 5},
++            {-2, 2, 4, 3, -1, -2},
++            {6, 4, 0, 2, 3, 1},
++            {6, 3, -1, 2, 0, 2},
++            {3, 2, -2, 2, 4, 4},
++            {4, 2, -1, -1, 2, 4},
++            {4, 1, -1, 3, 5, 2},
++            {-8, -4, 4, 9, 4, -4},
++    };
++    private static final int MEGAPHONE_EQ = 12;
++
++    /** Voice styles: clarity = presence / less mud, punch = compressor (evens out quiet and loud words),
++     *  broadcast = dynamic de-hiss + harmonic exciter (denser, more "radio" sounding voice). */
++    public static final String[] VOICE_NAMES = {"Natural", "Clear", "Loud & Clear", "Megaphone", "Broadcast"};
++    public static final float[] VOICE_CLARITY = {0f, 0.6f, 0.8f, 1f, 0.9f};
++    public static final float[] VOICE_PUNCH = {0f, 0.4f, 0.7f, 1f, 0.85f};
++    public static final boolean[] VOICE_BROADCAST = {false, false, false, false, true};
++
++    /** Microphone source ("In Channel"): Default / Cam / Voice / Mic / Call. Call is what Telegram uses normally. */
++    public static final String[] INPUT_NAMES = {"Default", "Cam", "Voice", "Mic", "Call"};
++    public static final String[] INPUT_INFO = {
++            "Phone default", "Camcorder mic", "Voice recognition, less processing", "Raw mic, loudest on many phones", "Call mode with echo cancel (normal)"};
++    /** android.media.MediaRecorder.AudioSource: DEFAULT, CAMCORDER, VOICE_RECOGNITION, MIC, VOICE_COMMUNICATION. */
++    public static final int[] INPUT_SOURCES = {0, 5, 6, 1, 7};
++    public static final int NORMAL_INPUT = 4;
++    public static int inputIndex = NORMAL_INPUT;
++
++    public static float gainDb = 24f;
++    public static float volume = 1f;
++    public static float clarity = 0f;
++    public static float punch = 0f;
++    public static boolean broadcast = false;
++    public static final float[] eqDb = new float[BANDS];
++
++    private static boolean loaded;
++
++    private static SharedPreferences prefs() {
++        return ApplicationLoader.applicationContext.getSharedPreferences("lordgram_fightmode", Context.MODE_PRIVATE);
++    }
++
++    public static synchronized void load() {
++        if (loaded) {
++            return;
++        }
++        loaded = true;
++        SharedPreferences p = prefs();
++        gainDb = clamp(p.getFloat("gainDb", 24f), 0f, MAX_GAIN_DB);
++        volume = clamp(p.getFloat("volume", 1f), 0f, 1f);
++        inputIndex = Math.min(Math.max(p.getInt("inputIndex", NORMAL_INPUT), 0), INPUT_NAMES.length - 1);
++        clarity = clamp(p.getFloat("clarity", 0f), 0f, 1f);
++        punch = clamp(p.getFloat("punch", 0f), 0f, 1f);
++        broadcast = p.getBoolean("broadcast", false);
++        for (int i = 0; i < BANDS; i++) {
++            eqDb[i] = clamp(p.getFloat("eq" + i, 0f), -MAX_EQ_DB, MAX_EQ_DB);
++        }
++    }
++
++    public static synchronized void save() {
++        SharedPreferences.Editor e = prefs().edit();
++        e.putInt("inputIndex", inputIndex);
++        e.putFloat("gainDb", gainDb).putFloat("volume", volume).putFloat("clarity", clarity).putFloat("punch", punch).putBoolean("broadcast", broadcast);
++        for (int i = 0; i < BANDS; i++) {
++            e.putFloat("eq" + i, eqDb[i]);
++        }
++        e.apply();
++    }
++
++    /** 9 values for the native side: 6 EQ bands, clarity, punch, broadcast (0/1). */
++    public static float[] toNative() {
++        float[] out = new float[BANDS + 3];
++        System.arraycopy(eqDb, 0, out, 0, BANDS);
++        out[BANDS] = clarity;
++        out[BANDS + 1] = punch;
++        out[BANDS + 2] = broadcast ? 1f : 0f;
++        return out;
++    }
++
++    /** Index of the preset equal to the current EQ, or -1 for "Custom". */
++    public static int matchingPreset() {
++        for (int p = 0; p < PRESETS.length; p++) {
++            boolean same = true;
++            for (int i = 0; i < BANDS; i++) {
++                if (Math.abs(PRESETS[p][i] - eqDb[i]) > 0.01f) {
++                    same = false;
++                    break;
++                }
++            }
++            if (same) {
++                return p;
++            }
++        }
++        return -1;
++    }
++
++    public static void applyPreset(int index) {
++        System.arraycopy(PRESETS[index], 0, eqDb, 0, BANDS);
++    }
++
++    /** Index of the voice style equal to the current clarity/punch, or -1 for "Custom". */
++    public static int matchingVoice() {
++        for (int i = 0; i < VOICE_NAMES.length; i++) {
++            if (Math.abs(VOICE_CLARITY[i] - clarity) < 0.02f && Math.abs(VOICE_PUNCH[i] - punch) < 0.02f && VOICE_BROADCAST[i] == broadcast) {
++                return i;
++            }
++        }
++        return -1;
++    }
++
++    private static final int MEGAPHONE_INDEX = 3;
++
++    public static void applyVoice(int index) {
++        clarity = VOICE_CLARITY[index];
++        punch = VOICE_PUNCH[index];
++        broadcast = VOICE_BROADCAST[index];
++        if (index == MEGAPHONE_INDEX) {
++            applyPreset(MEGAPHONE_EQ); // Megaphone also shapes the EQ: less bass, strong mids
++        }
++    }
++
++    /**
++     * Fight mode ON uses the chosen source, OFF goes back to the normal call source.
++     * Runs on a background thread because the recorder restart waits for its reader thread.
++     */
++    public static void applyInput(boolean fightModeOn) {
++        final int source = INPUT_SOURCES[fightModeOn ? inputIndex : NORMAL_INPUT];
++        new Thread(() -> WebRtcAudioRecord.switchAudioSource(source), "lg-mic-source").start();
++    }
++
++    /** A call ended: the next normal call must not inherit the fight mode source. */
++    public static void onCallEnded() {
++        WebRtcAudioRecord.resetAudioSource();
++    }
++
++    private static float clamp(float v, float lo, float hi) {
++        return Math.min(Math.max(v, lo), hi);
++    }
++
++    private FightMode() {}
++}
+diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/voip/NativeInstance.java b/TMessagesProj/src/main/java/org/telegram/messenger/voip/NativeInstance.java
+index 6df08c4..2a9fbf2 100644
+--- a/TMessagesProj/src/main/java/org/telegram/messenger/voip/NativeInstance.java
++++ b/TMessagesProj/src/main/java/org/telegram/messenger/voip/NativeInstance.java
+@@ -207,6 +207,8 @@ public class NativeInstance {
+ 
+     public native void onMediaDescriptionAvailable(long taskPtr, VoIPService.RequestedParticipant[] ssrcs);
+     public native void setNoiseSuppressionEnabled(boolean value);
++    public native void setFightMode(boolean enabled, float gainDb, float volume, float[] eqDb);
++    public native float getFightModeLevel();
+     public native void activateVideoCapturer(long videoCapturer);
+     public native void clearVideoCapturer();
+     public native long addIncomingVideoOutput(int quality, String endpointId, SsrcGroup[] ssrcGroups, VideoSink remoteSink, long userId);
+diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/voip/VoIPService.java b/TMessagesProj/src/main/java/org/telegram/messenger/voip/VoIPService.java
+index a01edcf..832b7c5 100755
+--- a/TMessagesProj/src/main/java/org/telegram/messenger/voip/VoIPService.java
++++ b/TMessagesProj/src/main/java/org/telegram/messenger/voip/VoIPService.java
+@@ -1001,6 +1001,36 @@ public class VoIPService extends Service implements SensorEventListener, AudioMa
+ 		tgVoip[CAPTURE_DEVICE_CAMERA].setNoiseSuppressionEnabled(enabled);
+ 	}
+ 
++	// Lord Gram: "Fight mode" (loud PA-style mic). ON/OFF lives only as long as the call, so a new call always starts OFF.
++	// It stays ON until the user switches it off from the 3-dot menu; the settings (gain, EQ, volume) are in FightMode.
++	private boolean fightModeEnabled;
++
++	public boolean isFightModeEnabled() {
++		return fightModeEnabled;
++	}
++
++	public void setFightMode(boolean enabled) {
++		fightModeEnabled = enabled;
++		applyFightMode();
++		FightMode.applyInput(enabled);
++	}
++
++	/** Pushes the current FightMode settings to the native audio pipeline. */
++	public void applyFightMode() {
++		if (tgVoip[CAPTURE_DEVICE_CAMERA] == null) {
++			return;
++		}
++		tgVoip[CAPTURE_DEVICE_CAMERA].setFightMode(fightModeEnabled, FightMode.gainDb, FightMode.volume, FightMode.toNative());
++	}
++
++	/** Output level (0..1) of the fight mode chain, for the widget's level meter. */
++	public float getFightModeLevel() {
++		if (tgVoip[CAPTURE_DEVICE_CAMERA] == null || !fightModeEnabled) {
++			return 0f;
++		}
++		return tgVoip[CAPTURE_DEVICE_CAMERA].getFightModeLevel();
++	}
++
+ 	public void setGroupCallHash(String hash) {
+ 		if (!currentGroupModeStreaming || TextUtils.isEmpty(hash) || hash.equals(joinHash)) {
+ 			return;
+@@ -3058,6 +3088,9 @@ public class VoIPService extends Service implements SensorEventListener, AudioMa
+ 				}
+ 			}, conference != null);
+ 			tgVoip[type].setOnStateUpdatedListener((state, inTransition) -> updateConnectionState(type, state, inTransition));
++			if (type == CAPTURE_DEVICE_CAMERA && fightModeEnabled) {
++				applyFightMode(); // instance was re-created (reconnect): keep fight mode
++			}
+ //			if (captureDevice[type] != 0 && type == 0 && convertingVoip != null && convertingVoip.hasVideoCapturer()) {
+ //				tgVoip[type].setupOutgoingVideoCreated(captureDevice[type]);
+ //			}
+@@ -4125,6 +4158,7 @@ public class VoIPService extends Service implements SensorEventListener, AudioMa
+ 
+ 	@Override
+ 	public void onDestroy() {
++		FightMode.onCallEnded();
+ 		if (BuildVars.LOGS_ENABLED) {
+ 			FileLog.d("=============== VoIPService STOPPING ===============");
+ 		}
+diff --git a/TMessagesProj/src/main/java/org/telegram/ui/Components/voip/FightModeBubble.java b/TMessagesProj/src/main/java/org/telegram/ui/Components/voip/FightModeBubble.java
+new file mode 100644
+index 0000000..0649b22
+--- /dev/null
++++ b/TMessagesProj/src/main/java/org/telegram/ui/Components/voip/FightModeBubble.java
+@@ -0,0 +1,136 @@
++package org.telegram.ui.Components.voip;
++
++import static org.telegram.messenger.AndroidUtilities.dp;
++
++import android.annotation.SuppressLint;
++import android.content.Context;
++import android.graphics.Canvas;
++import android.graphics.Paint;
++import android.graphics.RectF;
++import android.view.MotionEvent;
++import android.view.View;
++
++import org.telegram.messenger.voip.VoIPService;
++
++/**
++ * Lord Gram: the round microphone shown while Fight mode is ON (top right).
++ * Tap it to open the full microphone panel. Drag it to move it. It glows with the boosted mic level.
++ * It disappears only when Fight mode is switched off from the 3-dot menu.
++ */
++@SuppressLint("ViewConstructor")
++public class FightModeBubble extends View {
++
++    private static final int BG = 0xFF0B0F17;
++    private static final int ACCENT = 0xFF30D5FF;
++    private static final int LIVE = 0xFFFF3B5C;
++
++    private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
++    private final RectF rect = new RectF();
++    private final Runnable onTap;
++    private boolean live;
++    private float shownLevel;
++    private float downX, downY, startTx, startTy;
++    private boolean dragging;
++
++    private final Runnable ticker = new Runnable() {
++        @Override
++        public void run() {
++            VoIPService service = VoIPService.getSharedInstance();
++            live = service != null && !service.isMicMute();
++            float level = service != null ? service.getFightModeLevel() : 0f;
++            shownLevel = Math.max(level, shownLevel * 0.82f);
++            invalidate();
++            postDelayed(this, 60);
++        }
++    };
++
++    public FightModeBubble(Context context, Runnable onTap) {
++        super(context);
++        this.onTap = onTap;
++        setElevation(dp(8));
++    }
++
++    @Override
++    protected void onAttachedToWindow() {
++        super.onAttachedToWindow();
++        removeCallbacks(ticker);
++        post(ticker);
++    }
++
++    @Override
++    protected void onDetachedFromWindow() {
++        removeCallbacks(ticker);
++        super.onDetachedFromWindow();
++    }
++
++    @Override
++    protected void onDraw(Canvas c) {
++        float cx = getWidth() / 2f, cy = getHeight() / 2f;
++        float base = dp(20);
++        if (live && shownLevel > 0.02f) {
++            p.setStyle(Paint.Style.FILL);
++            p.setColor(ACCENT);
++            p.setAlpha((int) (110 * Math.min(1f, shownLevel * 1.5f)));
++            c.drawCircle(cx, cy, base + dp(7) * shownLevel, p);
++            p.setAlpha(255);
++        }
++        p.setStyle(Paint.Style.FILL);
++        p.setColor(BG);
++        c.drawCircle(cx, cy, base, p);
++        p.setStyle(Paint.Style.STROKE);
++        p.setStrokeWidth(dp(2));
++        p.setColor(live ? LIVE : ACCENT);
++        c.drawCircle(cx, cy, base, p);
++
++        // microphone glyph
++        int glyph = live ? LIVE : 0xFFFFFFFF;
++        p.setColor(glyph);
++        p.setStyle(Paint.Style.FILL);
++        rect.set(cx - dp(4), cy - dp(11), cx + dp(4), cy + dp(2));
++        c.drawRoundRect(rect, dp(4), dp(4), p);
++        p.setStyle(Paint.Style.STROKE);
++        p.setStrokeCap(Paint.Cap.ROUND);
++        rect.set(cx - dp(8), cy - dp(7), cx + dp(8), cy + dp(6));
++        c.drawArc(rect, 0, 180, false, p);
++        c.drawLine(cx, cy + dp(6), cx, cy + dp(11), p);
++        c.drawLine(cx - dp(4), cy + dp(11), cx + dp(4), cy + dp(11), p);
++        if (!live) {
++            p.setColor(0xFFFFFFFF);
++            c.drawLine(cx - dp(10), cy - dp(10), cx + dp(10), cy + dp(10), p);
++        }
++    }
++
++    @SuppressLint("ClickableViewAccessibility")
++    @Override
++    public boolean onTouchEvent(MotionEvent e) {
++        switch (e.getActionMasked()) {
++            case MotionEvent.ACTION_DOWN:
++                downX = e.getRawX();
++                downY = e.getRawY();
++                startTx = getTranslationX();
++                startTy = getTranslationY();
++                dragging = false;
++                if (getParent() != null) {
++                    getParent().requestDisallowInterceptTouchEvent(true);
++                }
++                return true;
++            case MotionEvent.ACTION_MOVE:
++                if (!dragging && (Math.abs(e.getRawX() - downX) > dp(8) || Math.abs(e.getRawY() - downY) > dp(8))) {
++                    dragging = true;
++                }
++                if (dragging) {
++                    setTranslationX(startTx + (e.getRawX() - downX));
++                    setTranslationY(startTy + (e.getRawY() - downY));
++                }
++                return true;
++            case MotionEvent.ACTION_UP:
++                if (!dragging && onTap != null) {
++                    onTap.run();
++                }
++                return true;
++            case MotionEvent.ACTION_CANCEL:
++                return true;
++        }
++        return super.onTouchEvent(e);
++    }
++}
+diff --git a/TMessagesProj/src/main/java/org/telegram/ui/Components/voip/FightModeWidget.java b/TMessagesProj/src/main/java/org/telegram/ui/Components/voip/FightModeWidget.java
+new file mode 100644
+index 0000000..6ca9e08
+--- /dev/null
++++ b/TMessagesProj/src/main/java/org/telegram/ui/Components/voip/FightModeWidget.java
+@@ -0,0 +1,1174 @@
++package org.telegram.ui.Components.voip;
++
++import static org.telegram.messenger.AndroidUtilities.dp;
++
++import android.annotation.SuppressLint;
++import android.content.Context;
++import android.graphics.Canvas;
++import android.graphics.Color;
++import android.graphics.LinearGradient;
++import android.graphics.Paint;
++import android.graphics.RadialGradient;
++import android.graphics.RectF;
++import android.graphics.Shader;
++import android.graphics.Typeface;
++import android.graphics.drawable.GradientDrawable;
++import android.view.Gravity;
++import android.view.MotionEvent;
++import android.view.View;
++import android.widget.FrameLayout;
++import android.widget.LinearLayout;
++import android.widget.TextView;
++
++import org.telegram.messenger.LocaleController;
++import org.telegram.messenger.R;
++import org.telegram.messenger.voip.FightMode;
++import org.telegram.messenger.voip.VoIPService;
++
++import java.util.Locale;
++
++/**
++ * Lord Gram: "Fight mode" microphone panel (dark studio / neon look).
++ * Tiles: Gain (rotary knob), Voice (clarity + punch), Equalizer (6 bands + presets), Input (mic source).
++ * Stage: LED level meter, a glowing studio mic (tap = mute / unmute) and a vertical volume slider.
++ * There is no close button on purpose: Fight mode is switched off only from the 3-dot menu.
++ */
++@SuppressLint("ViewConstructor")
++public class FightModeWidget extends FrameLayout {
++
++    private static final int BG_TOP = 0xFF0B0F17;
++    private static final int BG_BOTTOM = 0xFF161E2D;
++    private static final int STROKE = 0x883DD5FF;
++    private static final int TILE = 0xFF1B2333;
++    private static final int TILE_ON = 0xFF243452;
++    private static final int TEXT = 0xFFFFFFFF;
++    private static final int SUB = 0xFF8E9AAF;
++    private static final int CYAN = 0xFF30D5FF;
++    private static final int VIOLET = 0xFF8B5CF6;
++    private static final int HOT = 0xFFFF3B5C;
++    private static final int GREEN = 0xFF2ED573;
++    private static final int AMBER = 0xFFFFC53D;
++
++    private final Runnable collapseListener;
++    private final DotView dot;
++    private final Tile gainTile, voiceTile, eqTile, inputTile;
++    private final FrameLayout content;
++    private final LinearLayout stage, gainPanel, voicePanel, eqPanel, inputPanel;
++    private final LedMeter led;
++    private final MicArtView micArt;
++    private final SliderView volumeSlider;
++    private final TextView volumeLabel;
++    private final TextView status;
++    private final KnobView knob;
++    private final SliderView gainSlider;
++    private final SliderView claritySlider, punchSlider;
++    private final TextView clarityValue, punchValue;
++    private final LinearLayout slidersBox, presetBox;
++    private final SliderView[] eqSliders = new SliderView[FightMode.BANDS];
++    private final TextView[] eqValues = new TextView[FightMode.BANDS];
++    private final TextView[] inputMarks = new TextView[FightMode.INPUT_NAMES.length];
++
++    private int openPanel; // 0 none, 1 gain, 2 voice, 3 equalizer, 4 input
++    private float shownLevel;
++    private float downX, downY, startTx, startTy;
++
++    private final Runnable ticker = new Runnable() {
++        @Override
++        public void run() {
++            tick();
++            postDelayed(this, 60);
++        }
++    };
++
++    public FightModeWidget(Context context, Runnable onCollapse) {
++        super(context);
++        this.collapseListener = onCollapse;
++        FightMode.load();
++        setClickable(true); // swallow taps on the panel so they never reach the sheet below
++
++        GradientDrawable bg = new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, new int[]{BG_TOP, BG_BOTTOM});
++        bg.setCornerRadius(dp(20));
++        bg.setStroke(dp(1), STROKE);
++        setBackground(bg);
++        setElevation(dp(12));
++
++        LinearLayout root = new LinearLayout(context);
++        root.setOrientation(LinearLayout.VERTICAL);
++        root.setPadding(dp(12), dp(8), dp(12), dp(12));
++        addView(root, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
++
++        // ---- header (drag handle) ----
++        LinearLayout header = new LinearLayout(context);
++        header.setOrientation(LinearLayout.HORIZONTAL);
++        header.setGravity(Gravity.CENTER_VERTICAL);
++        header.setPadding(0, dp(4), 0, dp(8));
++        header.setOnTouchListener(this::onHeaderTouch);
++        root.addView(header, new LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
++
++        dot = new DotView(context);
++        header.addView(dot, new LinearLayout.LayoutParams(dp(14), dp(14)));
++
++        TextView title = new TextView(context);
++        title.setText(LocaleController.getString(R.string.FightModeMicrophone).toUpperCase(Locale.US));
++        title.setTextColor(TEXT);
++        title.setTextSize(14);
++        title.setTypeface(Typeface.DEFAULT_BOLD);
++        title.setLetterSpacing(0.14f);
++        title.setPadding(dp(8), 0, dp(8), 0);
++        header.addView(title, new LinearLayout.LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT));
++
++        View spacer = new View(context);
++        header.addView(spacer, new LinearLayout.LayoutParams(0, 1, 1f));
++
++        TextView collapse = new TextView(context);
++        collapse.setText("\u25BE");
++        collapse.setTextColor(SUB);
++        collapse.setTextSize(20);
++        collapse.setGravity(Gravity.CENTER);
++        collapse.setOnClickListener(v -> collapsePanel());
++        header.addView(collapse, new LinearLayout.LayoutParams(dp(40), dp(32)));
++
++        // ---- tiles ----
++        LinearLayout tiles = new LinearLayout(context);
++        tiles.setOrientation(LinearLayout.HORIZONTAL);
++        root.addView(tiles, new LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
++
++        gainTile = new Tile(context, LocaleController.getString(R.string.FightModeGain), IconView.KNOB);
++        voiceTile = new Tile(context, LocaleController.getString(R.string.FightModeVoice), IconView.VOICE);
++        eqTile = new Tile(context, "EQ", IconView.EQ);
++        inputTile = new Tile(context, "Input", IconView.MIC);
++        for (Tile t : new Tile[]{gainTile, voiceTile, eqTile, inputTile}) {
++            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f);
++            lp.setMargins(dp(3), 0, dp(3), 0);
++            tiles.addView(t, lp);
++        }
++        gainTile.setOnClickListener(v -> togglePanel(1));
++        voiceTile.setOnClickListener(v -> togglePanel(2));
++        eqTile.setOnClickListener(v -> togglePanel(3));
++        inputTile.setOnClickListener(v -> togglePanel(4));
++
++        content = new FrameLayout(context);
++        LinearLayout.LayoutParams contentLp = new LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT);
++        contentLp.topMargin = dp(10);
++        root.addView(content, contentLp);
++
++        // ---- stage: LED meter | mic | volume ----
++        stage = new LinearLayout(context);
++        stage.setOrientation(LinearLayout.HORIZONTAL);
++        content.addView(stage, new LayoutParams(LayoutParams.MATCH_PARENT, dp(214)));
++
++        led = new LedMeter(context);
++        LinearLayout.LayoutParams ledLp = new LinearLayout.LayoutParams(dp(14), LayoutParams.MATCH_PARENT);
++        ledLp.setMargins(dp(4), dp(8), dp(4), dp(28));
++        stage.addView(led, ledLp);
++
++        micArt = new MicArtView(context);
++        micArt.setOnClickListener(v -> toggleMic());
++        stage.addView(micArt, new LinearLayout.LayoutParams(0, LayoutParams.MATCH_PARENT, 1f));
++
++        LinearLayout volumeBox = new LinearLayout(context);
++        volumeBox.setOrientation(LinearLayout.VERTICAL);
++        volumeBox.setGravity(Gravity.CENTER_HORIZONTAL);
++        stage.addView(volumeBox, new LinearLayout.LayoutParams(dp(46), LayoutParams.MATCH_PARENT));
++
++        volumeLabel = new TextView(context);
++        volumeLabel.setTextColor(SUB);
++        volumeLabel.setTextSize(11);
++        volumeLabel.setGravity(Gravity.CENTER);
++        volumeBox.addView(volumeLabel, new LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
++
++        volumeSlider = new SliderView(context, true);
++        volumeSlider.setListener(new SliderView.Listener() {
++            @Override
++            public void onChanged(float value, boolean fromUser) {
++                onVolumeChanged(value);
++            }
++
++            @Override
++            public void onStop() {
++                FightMode.save();
++            }
++        });
++        volumeBox.addView(volumeSlider, new LinearLayout.LayoutParams(dp(40), 0, 1f));
++
++        // ---- gain panel: knob + slider + quick values ----
++        gainPanel = newPanel(context);
++        knob = new KnobView(context);
++        knob.setListener(new KnobView.Listener() {
++            @Override
++            public void onChanged(float value) {
++                onGainChanged(value * FightMode.MAX_GAIN_DB);
++            }
++
++            @Override
++            public void onStop() {
++                FightMode.save();
++            }
++        });
++        gainPanel.addView(knob, new LinearLayout.LayoutParams(dp(170), dp(150)));
++
++        gainSlider = new SliderView(context, false);
++        gainSlider.setListener(new SliderView.Listener() {
++            @Override
++            public void onChanged(float value, boolean fromUser) {
++                onGainChanged(value * FightMode.MAX_GAIN_DB);
++            }
++
++            @Override
++            public void onStop() {
++                FightMode.save();
++            }
++        });
++        gainPanel.addView(gainSlider, new LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, dp(36)));
++
++        LinearLayout quick = new LinearLayout(context);
++        quick.setOrientation(LinearLayout.HORIZONTAL);
++        LinearLayout.LayoutParams quickLp = new LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, dp(36));
++        quickLp.topMargin = dp(6);
++        gainPanel.addView(quick, quickLp);
++        final int[] quickDb = {12, 24, 40, 60};
++        for (int i = 0; i < quickDb.length; i++) {
++            final int db = quickDb[i];
++            TextView q = chipView(context, db + " dB");
++            q.setOnClickListener(v -> onGainPreset(db));
++            LinearLayout.LayoutParams qLp = new LinearLayout.LayoutParams(0, LayoutParams.MATCH_PARENT, 1f);
++            qLp.setMargins(dp(3), 0, dp(3), 0);
++            quick.addView(q, qLp);
++        }
++        TextView gainHint = hintView(context, "Above 40 dB a noise gate cuts hiss. Above 60 dB the voice is already at maximum, only noise grows.");
++        gainPanel.addView(gainHint, new LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
++        content.addView(gainPanel, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
++
++        // ---- voice panel: styles + clarity + punch ----
++        voicePanel = newPanel(context);
++        for (int i = 0; i < FightMode.VOICE_NAMES.length; i += 2) {
++            LinearLayout line = new LinearLayout(context);
++            line.setOrientation(LinearLayout.HORIZONTAL);
++            LinearLayout.LayoutParams lineLp = new LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, dp(40));
++            lineLp.bottomMargin = dp(6);
++            voicePanel.addView(line, lineLp);
++            for (int j = i; j < Math.min(i + 2, FightMode.VOICE_NAMES.length); j++) {
++                final int index = j;
++                TextView c = chipView(context, FightMode.VOICE_NAMES[j]);
++                c.setOnClickListener(v -> onVoiceStyle(index));
++                LinearLayout.LayoutParams cLp = new LinearLayout.LayoutParams(0, LayoutParams.MATCH_PARENT, 1f);
++                cLp.setMargins(dp(3), 0, dp(3), 0);
++                line.addView(c, cLp);
++            }
++        }
++        clarityValue = new TextView(context);
++        claritySlider = addLabeledSlider(context, voicePanel, LocaleController.getString(R.string.FightModeClarity), clarityValue);
++        claritySlider.setListener(new SliderView.Listener() {
++            @Override
++            public void onChanged(float value, boolean fromUser) {
++                onClarityChanged(value);
++            }
++
++            @Override
++            public void onStop() {
++                FightMode.save();
++            }
++        });
++        punchValue = new TextView(context);
++        punchSlider = addLabeledSlider(context, voicePanel, LocaleController.getString(R.string.FightModePunch), punchValue);
++        punchSlider.setListener(new SliderView.Listener() {
++            @Override
++            public void onChanged(float value, boolean fromUser) {
++                onPunchChanged(value);
++            }
++
++            @Override
++            public void onStop() {
++                FightMode.save();
++            }
++        });
++        voicePanel.addView(hintView(context, LocaleController.getString(R.string.FightModeVoiceHint)),
++                new LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
++        content.addView(voicePanel, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
++
++        // ---- equalizer panel ----
++        eqPanel = newPanel(context);
++        LinearLayout eqButtons = new LinearLayout(context);
++        eqButtons.setOrientation(LinearLayout.HORIZONTAL);
++        eqPanel.addView(eqButtons, new LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, dp(40)));
++        TextView presets = chipView(context, LocaleController.getString(R.string.FightModePresets));
++        TextView reset = chipView(context, LocaleController.getString(R.string.FightModeReset));
++        LinearLayout.LayoutParams b1 = new LinearLayout.LayoutParams(0, LayoutParams.MATCH_PARENT, 1f);
++        b1.rightMargin = dp(4);
++        LinearLayout.LayoutParams b2 = new LinearLayout.LayoutParams(0, LayoutParams.MATCH_PARENT, 1f);
++        b2.leftMargin = dp(4);
++        eqButtons.addView(presets, b1);
++        eqButtons.addView(reset, b2);
++        presets.setOnClickListener(v -> togglePresetList());
++        reset.setOnClickListener(v -> onEqPreset(0));
++
++        slidersBox = new LinearLayout(context);
++        slidersBox.setOrientation(LinearLayout.VERTICAL);
++        eqPanel.addView(slidersBox, new LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
++
++        presetBox = new LinearLayout(context);
++        presetBox.setOrientation(LinearLayout.VERTICAL);
++        presetBox.setVisibility(GONE);
++        eqPanel.addView(presetBox, new LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
++        for (int i = 0; i < FightMode.PRESET_NAMES.length; i += 2) {
++            LinearLayout line = new LinearLayout(context);
++            line.setOrientation(LinearLayout.HORIZONTAL);
++            LinearLayout.LayoutParams lineLp = new LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, dp(38));
++            lineLp.topMargin = dp(6);
++            presetBox.addView(line, lineLp);
++            for (int j = i; j < Math.min(i + 2, FightMode.PRESET_NAMES.length); j++) {
++                final int index = j;
++                TextView c = chipView(context, FightMode.PRESET_NAMES[j]);
++                c.setOnClickListener(v -> onEqPreset(index));
++                LinearLayout.LayoutParams cLp = new LinearLayout.LayoutParams(0, LayoutParams.MATCH_PARENT, 1f);
++                cLp.setMargins(dp(3), 0, dp(3), 0);
++                line.addView(c, cLp);
++            }
++        }
++        for (int i = 0; i < FightMode.BANDS; i++) {
++            final int band = i;
++            LinearLayout row = new LinearLayout(context);
++            row.setOrientation(LinearLayout.VERTICAL);
++            LinearLayout.LayoutParams rowLp = new LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT);
++            rowLp.topMargin = dp(2);
++            slidersBox.addView(row, rowLp);
++
++            LinearLayout labels = new LinearLayout(context);
++            labels.setOrientation(LinearLayout.HORIZONTAL);
++            row.addView(labels, new LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
++            TextView freq = new TextView(context);
++            freq.setText(FightMode.EQ_FREQ[i] + " Hz");
++            freq.setTextColor(TEXT);
++            freq.setTextSize(12);
++            labels.addView(freq, new LinearLayout.LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f));
++            eqValues[i] = new TextView(context);
++            eqValues[i].setTextColor(CYAN);
++            eqValues[i].setTextSize(12);
++            labels.addView(eqValues[i], new LinearLayout.LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT));
++
++            eqSliders[i] = new SliderView(context, false);
++            eqSliders[i].setListener(new SliderView.Listener() {
++                @Override
++                public void onChanged(float value, boolean fromUser) {
++                    onEqBandChanged(band, value);
++                }
++
++                @Override
++                public void onStop() {
++                    FightMode.save();
++                }
++            });
++            row.addView(eqSliders[i], new LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, dp(32)));
++        }
++        content.addView(eqPanel, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
++
++        // ---- input panel: In Channel (microphone source) ----
++        inputPanel = newPanel(context);
++        for (int i = 0; i < FightMode.INPUT_NAMES.length; i++) {
++            final int index = i;
++            LinearLayout row = new LinearLayout(context);
++            row.setOrientation(LinearLayout.HORIZONTAL);
++            row.setGravity(Gravity.CENTER_VERTICAL);
++            row.setPadding(dp(6), 0, dp(6), 0);
++            row.setOnClickListener(v -> onInputChosen(index));
++            inputPanel.addView(row, new LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, dp(46)));
++
++            inputMarks[i] = new TextView(context);
++            inputMarks[i].setTextSize(18);
++            inputMarks[i].setGravity(Gravity.CENTER);
++            row.addView(inputMarks[i], new LinearLayout.LayoutParams(dp(30), LayoutParams.WRAP_CONTENT));
++
++            LinearLayout texts = new LinearLayout(context);
++            texts.setOrientation(LinearLayout.VERTICAL);
++            row.addView(texts, new LinearLayout.LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f));
++            TextView name = new TextView(context);
++            name.setText(FightMode.INPUT_NAMES[i]);
++            name.setTextColor(TEXT);
++            name.setTextSize(15);
++            texts.addView(name, new LinearLayout.LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT));
++            TextView info = new TextView(context);
++            info.setText(FightMode.INPUT_INFO[i]);
++            info.setTextColor(SUB);
++            info.setTextSize(11);
++            texts.addView(info, new LinearLayout.LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT));
++        }
++        inputPanel.addView(hintView(context, "Changing the input restarts the mic for a moment. If your phone ignores a source, it keeps the old one."),
++                new LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
++        content.addView(inputPanel, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
++
++        // ---- status ----
++        status = new TextView(context);
++        status.setTextSize(12);
++        status.setGravity(Gravity.CENTER);
++        LinearLayout.LayoutParams stLp = new LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT);
++        stLp.topMargin = dp(8);
++        root.addView(status, stLp);
++
++
++        setPanelVisibility();
++        syncFromSettings();
++        refresh();
++    }
++
++    // ---------------------------------------------------------------- logic (the listeners only call these methods)
++
++    private void collapsePanel() {
++        if (collapseListener != null) {
++            collapseListener.run();
++        }
++    }
++
++    private void toggleMic() {
++        VoIPService service = VoIPService.getSharedInstance();
++        if (service != null) {
++            service.setMicMute(!service.isMicMute(), false, true);
++            refresh();
++        }
++    }
++
++    private void togglePanel(int which) {
++        openPanel = openPanel == which ? 0 : which;
++        presetBox.setVisibility(GONE);
++        slidersBox.setVisibility(VISIBLE);
++        setPanelVisibility();
++    }
++
++    private void setPanelVisibility() {
++        stage.setVisibility(openPanel == 0 ? VISIBLE : GONE);
++        gainPanel.setVisibility(openPanel == 1 ? VISIBLE : GONE);
++        voicePanel.setVisibility(openPanel == 2 ? VISIBLE : GONE);
++        eqPanel.setVisibility(openPanel == 3 ? VISIBLE : GONE);
++        inputPanel.setVisibility(openPanel == 4 ? VISIBLE : GONE);
++        gainTile.setSelectedTile(openPanel == 1);
++        voiceTile.setSelectedTile(openPanel == 2);
++        eqTile.setSelectedTile(openPanel == 3);
++        inputTile.setSelectedTile(openPanel == 4);
++    }
++
++    private void togglePresetList() {
++        boolean show = presetBox.getVisibility() != VISIBLE;
++        presetBox.setVisibility(show ? VISIBLE : GONE);
++        slidersBox.setVisibility(show ? GONE : VISIBLE);
++    }
++
++    private void pushToNative() {
++        VoIPService service = VoIPService.getSharedInstance();
++        if (service != null) {
++            service.applyFightMode();
++        }
++    }
++
++    private void onGainChanged(float db) {
++        FightMode.gainDb = Math.min(Math.max(Math.round(db), 0), FightMode.MAX_GAIN_DB);
++        updateGainViews();
++        pushToNative();
++    }
++
++    private void onGainPreset(int db) {
++        FightMode.gainDb = db;
++        updateGainViews();
++        FightMode.save();
++        pushToNative();
++    }
++
++    private void onVolumeChanged(float value) {
++        FightMode.volume = value;
++        updateVolumeLabel();
++        pushToNative();
++    }
++
++    private void onClarityChanged(float value) {
++        FightMode.clarity = value;
++        updateVoiceViews();
++        pushToNative();
++    }
++
++    private void onPunchChanged(float value) {
++        FightMode.punch = value;
++        updateVoiceViews();
++        pushToNative();
++    }
++
++    private void onVoiceStyle(int index) {
++        FightMode.applyVoice(index);
++        syncFromSettings();
++        FightMode.save();
++        pushToNative();
++    }
++
++    private void onEqBandChanged(int band, float value) {
++        FightMode.eqDb[band] = Math.round(value * 2f * FightMode.MAX_EQ_DB - FightMode.MAX_EQ_DB);
++        updateEqTexts();
++        pushToNative();
++    }
++
++    private void onEqPreset(int index) {
++        FightMode.applyPreset(index);
++        presetBox.setVisibility(GONE);
++        slidersBox.setVisibility(VISIBLE);
++        syncFromSettings();
++        FightMode.save();
++        pushToNative();
++    }
++
++    private void onInputChosen(int index) {
++        FightMode.inputIndex = index;
++        FightMode.save();
++        FightMode.applyInput(true);
++        updateInputViews();
++    }
++
++    private void syncFromSettings() {
++        updateGainViews();
++        updateVolumeLabel();
++        updateVoiceViews();
++        updateEqTexts();
++        updateInputViews();
++        volumeSlider.setValue(FightMode.volume);
++        for (int i = 0; i < FightMode.BANDS; i++) {
++            eqSliders[i].setValue((FightMode.eqDb[i] + FightMode.MAX_EQ_DB) / (2f * FightMode.MAX_EQ_DB));
++        }
++    }
++
++    private void updateGainViews() {
++        gainTile.setValue(String.format(Locale.US, "%ddB", Math.round(FightMode.gainDb)));
++        knob.setValue(FightMode.gainDb / FightMode.MAX_GAIN_DB);
++        gainSlider.setValue(FightMode.gainDb / FightMode.MAX_GAIN_DB);
++    }
++
++    private void updateVolumeLabel() {
++        volumeLabel.setText(String.format(Locale.US, "%d%%", Math.round(FightMode.volume * 100f)));
++    }
++
++    private void updateVoiceViews() {
++        claritySlider.setValue(FightMode.clarity);
++        punchSlider.setValue(FightMode.punch);
++        clarityValue.setText(String.format(Locale.US, "%d%%", Math.round(FightMode.clarity * 100f)));
++        punchValue.setText(String.format(Locale.US, "%d%%", Math.round(FightMode.punch * 100f)));
++        int style = FightMode.matchingVoice();
++        voiceTile.setValue(style >= 0 ? FightMode.VOICE_NAMES[style] : LocaleController.getString(R.string.FightModeCustom));
++    }
++
++    private void updateEqTexts() {
++        for (int i = 0; i < FightMode.BANDS; i++) {
++            eqValues[i].setText(String.format(Locale.US, "%d db", Math.round(FightMode.eqDb[i])));
++        }
++        int preset = FightMode.matchingPreset();
++        eqTile.setValue(preset >= 0 ? FightMode.PRESET_NAMES[preset] : LocaleController.getString(R.string.FightModeCustom));
++    }
++
++    private void updateInputViews() {
++        for (int i = 0; i < inputMarks.length; i++) {
++            boolean on = i == FightMode.inputIndex;
++            inputMarks[i].setText(on ? "\u25CF" : "\u25CB");
++            inputMarks[i].setTextColor(on ? CYAN : SUB);
++        }
++        inputTile.setValue(FightMode.INPUT_NAMES[FightMode.inputIndex]);
++    }
++
++    private void tick() {
++        VoIPService service = VoIPService.getSharedInstance();
++        float level = service != null ? service.getFightModeLevel() : 0f;
++        shownLevel = Math.max(level, shownLevel * 0.82f);
++        micArt.setLevel(shownLevel);
++        led.setLevel(shownLevel);
++        refresh();
++    }
++
++    /** Updates the live / muted look from the real mic state. */
++    public void refresh() {
++        VoIPService service = VoIPService.getSharedInstance();
++        boolean live = service != null && !service.isMicMute();
++        micArt.setLive(live);
++        dot.setLive(live);
++        status.setText(LocaleController.getString(live ? R.string.FightModeMicLive : R.string.FightModeMicMuted));
++        status.setTextColor(live ? HOT : SUB);
++    }
++
++    @Override
++    protected void onAttachedToWindow() {
++        super.onAttachedToWindow();
++        removeCallbacks(ticker);
++        post(ticker);
++    }
++
++    @Override
++    protected void onDetachedFromWindow() {
++        removeCallbacks(ticker);
++        super.onDetachedFromWindow();
++    }
++
++    @SuppressLint("ClickableViewAccessibility")
++    private boolean onHeaderTouch(View v, MotionEvent ev) {
++        switch (ev.getActionMasked()) {
++            case MotionEvent.ACTION_DOWN:
++                downX = ev.getRawX();
++                downY = ev.getRawY();
++                startTx = getTranslationX();
++                startTy = getTranslationY();
++                if (getParent() != null) {
++                    getParent().requestDisallowInterceptTouchEvent(true);
++                }
++                return true;
++            case MotionEvent.ACTION_MOVE:
++                setTranslationX(startTx + (ev.getRawX() - downX));
++                setTranslationY(startTy + (ev.getRawY() - downY));
++                return true;
++            default:
++                return true;
++        }
++    }
++
++    // ---------------------------------------------------------------- small view helpers
++
++    private static LinearLayout newPanel(Context context) {
++        LinearLayout panel = new LinearLayout(context);
++        panel.setOrientation(LinearLayout.VERTICAL);
++        panel.setGravity(Gravity.CENTER_HORIZONTAL);
++        panel.setPadding(dp(10), dp(10), dp(10), dp(10));
++        GradientDrawable d = new GradientDrawable();
++        d.setCornerRadius(dp(14));
++        d.setColor(0xFF111827);
++        d.setStroke(dp(1), 0xFF263148);
++        panel.setBackground(d);
++        panel.setVisibility(GONE);
++        return panel;
++    }
++
++    private static TextView chipView(Context context, String text) {
++        TextView t = new TextView(context);
++        t.setText(text);
++        t.setTextColor(TEXT);
++        t.setTextSize(13);
++        t.setGravity(Gravity.CENTER);
++        t.setSingleLine(true);
++        GradientDrawable d = new GradientDrawable();
++        d.setCornerRadius(dp(10));
++        d.setColor(TILE);
++        d.setStroke(dp(1), 0xFF2C3A57);
++        t.setBackground(d);
++        return t;
++    }
++
++    private static TextView hintView(Context context, String text) {
++        TextView t = new TextView(context);
++        t.setText(text);
++        t.setTextColor(SUB);
++        t.setTextSize(11);
++        t.setPadding(dp(4), dp(8), dp(4), 0);
++        return t;
++    }
++
++    /** Adds "label ....... value" over a slider. Returns the slider. */
++    private static SliderView addLabeledSlider(Context context, LinearLayout parent, String label, TextView valueView) {
++        LinearLayout labels = new LinearLayout(context);
++        labels.setOrientation(LinearLayout.HORIZONTAL);
++        parent.addView(labels, new LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
++        TextView name = new TextView(context);
++        name.setText(label);
++        name.setTextColor(TEXT);
++        name.setTextSize(13);
++        labels.addView(name, new LinearLayout.LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f));
++        valueView.setTextColor(CYAN);
++        valueView.setTextSize(13);
++        labels.addView(valueView, new LinearLayout.LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT));
++        SliderView slider = new SliderView(context, false);
++        parent.addView(slider, new LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, dp(34)));
++        return slider;
++    }
++
++    // ---------------------------------------------------------------- custom views
++
++    private static class Tile extends LinearLayout {
++        private final TextView value;
++        private final GradientDrawable bg = new GradientDrawable();
++
++        Tile(Context context, String label, int icon) {
++            super(context);
++            setOrientation(VERTICAL);
++            setGravity(Gravity.CENTER_HORIZONTAL);
++            setPadding(dp(2), dp(7), dp(2), dp(7));
++            bg.setCornerRadius(dp(12));
++            bg.setColor(TILE);
++            bg.setStroke(dp(1), 0xFF2C3A57);
++            setBackground(bg);
++            setClickable(true);
++
++            TextView name = new TextView(context);
++            name.setText(label);
++            name.setTextColor(SUB);
++            name.setTextSize(10);
++            name.setTypeface(Typeface.DEFAULT_BOLD);
++            name.setGravity(Gravity.CENTER);
++            name.setSingleLine(true);
++            addView(name, new LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT));
++
++            addView(new IconView(context, icon, CYAN), new LayoutParams(dp(26), dp(26)));
++
++            value = new TextView(context);
++            value.setTextColor(TEXT);
++            value.setTextSize(11);
++            value.setSingleLine(true);
++            value.setGravity(Gravity.CENTER);
++            addView(value, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
++        }
++
++        void setValue(String text) {
++            value.setText(text);
++        }
++
++        void setSelectedTile(boolean selected) {
++            bg.setColor(selected ? TILE_ON : TILE);
++            bg.setStroke(dp(selected ? 1.5f : 1f), selected ? CYAN : 0xFF2C3A57);
++        }
++    }
++
++    /** Pulsing "live" dot in the header. */
++    private static class DotView extends View {
++        private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
++        private boolean live;
++
++        DotView(Context context) {
++            super(context);
++        }
++
++        void setLive(boolean live) {
++            if (this.live != live) {
++                this.live = live;
++                invalidate();
++            }
++        }
++
++        @Override
++        protected void onDraw(Canvas c) {
++            float cx = getWidth() / 2f, cy = getHeight() / 2f;
++            if (live) {
++                p.setColor(HOT);
++                p.setAlpha(70);
++                c.drawCircle(cx, cy, dp(7), p);
++                p.setAlpha(255);
++            }
++            p.setColor(live ? HOT : SUB);
++            c.drawCircle(cx, cy, dp(4), p);
++        }
++    }
++
++    /** Simple vector icons drawn in code (no image assets). */
++    private static class IconView extends View {
++        static final int MIC = 0, KNOB = 1, VOICE = 2, EQ = 3;
++        private final int type;
++        private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
++        private final RectF rect = new RectF();
++
++        IconView(Context context, int type, int color) {
++            super(context);
++            this.type = type;
++            p.setColor(color);
++            p.setStrokeCap(Paint.Cap.ROUND);
++        }
++
++        @Override
++        protected void onDraw(Canvas c) {
++            float cx = getWidth() / 2f, cy = getHeight() / 2f;
++            float r = Math.min(getWidth(), getHeight()) / 2f - dp(1);
++            p.setStrokeWidth(Math.max(dp(2), r * 0.14f));
++            p.setStyle(Paint.Style.STROKE);
++            switch (type) {
++                case KNOB: {
++                    c.drawCircle(cx, cy, r * 0.62f, p);
++                    c.drawLine(cx, cy, cx + r * 0.38f, cy - r * 0.38f, p);
++                    for (int i = 0; i <= 8; i++) {
++                        double a = Math.toRadians(-135 + i * 33.75);
++                        c.drawLine(cx + (float) Math.sin(a) * r * 0.84f, cy - (float) Math.cos(a) * r * 0.84f,
++                                cx + (float) Math.sin(a) * r, cy - (float) Math.cos(a) * r, p);
++                    }
++                    break;
++                }
++                case VOICE: {
++                    float[] heights = {0.25f, 0.6f, 0.95f, 0.5f, 0.75f, 0.3f};
++                    for (int i = 0; i < heights.length; i++) {
++                        float x = cx - r * 0.85f + i * (r * 1.7f / (heights.length - 1));
++                        c.drawLine(x, cy - r * heights[i] * 0.85f, x, cy + r * heights[i] * 0.85f, p);
++                    }
++                    break;
++                }
++                case EQ: {
++                    float[] xs = {cx - r * 0.6f, cx, cx + r * 0.6f};
++                    float[] ys = {cy - r * 0.3f, cy + r * 0.3f, cy - r * 0.05f};
++                    for (int i = 0; i < 3; i++) {
++                        p.setStyle(Paint.Style.STROKE);
++                        c.drawLine(xs[i], cy - r * 0.85f, xs[i], cy + r * 0.85f, p);
++                        p.setStyle(Paint.Style.FILL);
++                        c.drawCircle(xs[i], ys[i], r * 0.2f, p);
++                    }
++                    break;
++                }
++                default: { // MIC
++                    rect.set(cx - r * 0.3f, cy - r * 0.85f, cx + r * 0.3f, cy + r * 0.1f);
++                    p.setStyle(Paint.Style.FILL);
++                    c.drawRoundRect(rect, r * 0.3f, r * 0.3f, p);
++                    p.setStyle(Paint.Style.STROKE);
++                    rect.set(cx - r * 0.58f, cy - r * 0.5f, cx + r * 0.58f, cy + r * 0.45f);
++                    c.drawArc(rect, 0, 180, false, p);
++                    c.drawLine(cx, cy + r * 0.45f, cx, cy + r * 0.85f, p);
++                    c.drawLine(cx - r * 0.3f, cy + r * 0.85f, cx + r * 0.3f, cy + r * 0.85f, p);
++                }
++            }
++        }
++    }
++
++    /** Rotary gain knob: drag up / down (or tap) to change. value 0..1 maps to 0..100 dB. */
++    private static class KnobView extends View {
++        interface Listener {
++            void onChanged(float value);
++
++            void onStop();
++        }
++
++        private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
++        private final Paint t = new Paint(Paint.ANTI_ALIAS_FLAG);
++        private final RectF rect = new RectF();
++        private float value;
++        private float downY, startValue;
++        private Listener listener;
++
++        KnobView(Context context) {
++            super(context);
++            p.setStrokeCap(Paint.Cap.ROUND);
++            t.setTextAlign(Paint.Align.CENTER);
++            t.setTypeface(Typeface.DEFAULT_BOLD);
++        }
++
++        void setListener(Listener l) {
++            listener = l;
++        }
++
++        void setValue(float v) {
++            value = Math.min(Math.max(v, 0f), 1f);
++            invalidate();
++        }
++
++        @Override
++        protected void onDraw(Canvas c) {
++            float cx = getWidth() / 2f, cy = getHeight() / 2f;
++            float r = Math.min(getWidth(), getHeight()) / 2f - dp(10);
++            rect.set(cx - r, cy - r, cx + r, cy + r);
++            p.setStyle(Paint.Style.STROKE);
++            p.setStrokeWidth(dp(10));
++            p.setShader(null);
++            p.setColor(0xFF222B3D);
++            c.drawArc(rect, 135, 270, false, p);
++            if (value > 0.004f) {
++                p.setShader(new LinearGradient(cx - r, cy + r, cx + r, cy - r, CYAN, VIOLET, Shader.TileMode.CLAMP));
++                c.drawArc(rect, 135, 270 * value, false, p);
++                p.setShader(null);
++            }
++            double a = Math.toRadians(135 + 270 * value);
++            p.setStyle(Paint.Style.FILL);
++            p.setColor(TEXT);
++            c.drawCircle(cx + (float) Math.cos(a) * r, cy + (float) Math.sin(a) * r, dp(7), p);
++            p.setColor(0xFF0F1522);
++            c.drawCircle(cx, cy, r - dp(16), p);
++            t.setColor(TEXT);
++            t.setTextSize(dp(34));
++            c.drawText(String.valueOf(Math.round(value * FightMode.MAX_GAIN_DB)), cx, cy + dp(8), t);
++            t.setColor(SUB);
++            t.setTextSize(dp(12));
++            c.drawText("dB  GAIN", cx, cy + dp(26), t);
++        }
++
++        @SuppressLint("ClickableViewAccessibility")
++        @Override
++        public boolean onTouchEvent(MotionEvent e) {
++            switch (e.getActionMasked()) {
++                case MotionEvent.ACTION_DOWN:
++                    if (getParent() != null) {
++                        getParent().requestDisallowInterceptTouchEvent(true);
++                    }
++                    downY = e.getY();
++                    startValue = value;
++                    return true;
++                case MotionEvent.ACTION_MOVE: {
++                    float delta = (downY - e.getY()) / dp(280);
++                    value = Math.min(Math.max(startValue + delta, 0f), 1f);
++                    invalidate();
++                    if (listener != null) {
++                        listener.onChanged(value);
++                    }
++                    return true;
++                }
++                case MotionEvent.ACTION_UP:
++                case MotionEvent.ACTION_CANCEL:
++                    if (listener != null) {
++                        listener.onStop();
++                    }
++                    return true;
++            }
++            return super.onTouchEvent(e);
++        }
++    }
++
++    /** The glowing studio microphone. Tap it to go live / mute. Rings pulse with the output level. */
++    private static class MicArtView extends View {
++        private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
++        private final RectF rect = new RectF();
++        private boolean live;
++        private float level;
++        private float phase;
++
++        MicArtView(Context context) {
++            super(context);
++            setClickable(true);
++        }
++
++        void setLive(boolean live) {
++            if (this.live != live) {
++                this.live = live;
++                invalidate();
++            }
++        }
++
++        void setLevel(float level) {
++            this.level = level;
++            phase = (phase + 0.012f + level * 0.05f) % 1f;
++            invalidate();
++        }
++
++        @Override
++        protected void onDraw(Canvas c) {
++            // virtual canvas 200 x 262
++            float s = Math.min(getWidth() / 200f, getHeight() / 262f);
++            c.save();
++            c.translate((getWidth() - 200f * s) / 2f, (getHeight() - 262f * s) / 2f);
++            c.scale(s, s);
++
++            int accent = live ? CYAN : 0xFF5C6678;
++            int accentDark = live ? 0xFF0C4A6E : 0xFF2A313D;
++
++            if (live) {
++                for (int k = 0; k < 3; k++) {
++                    float ph = (phase + k / 3f) % 1f;
++                    float rr = 50f + ph * 62f;
++                    int alpha = (int) (170f * (1f - ph) * Math.min(1f, 0.25f + level * 1.8f));
++                    p.setStyle(Paint.Style.STROKE);
++                    p.setStrokeWidth(2.5f);
++                    p.setColor(accent);
++                    p.setAlpha(Math.max(0, Math.min(255, alpha)));
++                    c.drawCircle(100, 80, rr, p);
++                }
++                p.setAlpha(255);
++                float gr = 80f + 40f * level;
++                p.setStyle(Paint.Style.FILL);
++                p.setShader(new RadialGradient(100, 80, gr, new int[]{0x553DD5FF, 0x00000000}, null, Shader.TileMode.CLAMP));
++                c.drawCircle(100, 80, gr, p);
++                p.setShader(null);
++            }
++
++            // stand and base
++            p.setStyle(Paint.Style.FILL);
++            p.setColor(0xFF3A4455);
++            rect.set(95, 168, 105, 220);
++            c.drawRoundRect(rect, 4, 4, p);
++            p.setShader(new LinearGradient(40, 0, 160, 0, new int[]{accentDark, accent, accentDark}, null, Shader.TileMode.CLAMP));
++            rect.set(42, 212, 158, 238);
++            c.drawOval(rect, p);
++            p.setShader(null);
++            p.setColor(0xFF0B0F17);
++            rect.set(54, 216, 146, 232);
++            c.drawOval(rect, p);
++
++            // holder
++            p.setStyle(Paint.Style.STROKE);
++            p.setStrokeWidth(5);
++            p.setStrokeCap(Paint.Cap.ROUND);
++            p.setColor(0xFF566177);
++            rect.set(52, 66, 148, 168);
++            c.drawArc(rect, 8, 164, false, p);
++
++            // head: steel capsule with mesh
++            p.setStyle(Paint.Style.FILL);
++            p.setShader(new LinearGradient(62, 0, 138, 0, new int[]{0xFF222A38, 0xFF7C8BA3, 0xFF222A38}, null, Shader.TileMode.CLAMP));
++            rect.set(62, 20, 138, 130);
++            c.drawRoundRect(rect, 38, 38, p);
++            p.setShader(null);
++            c.save();
++            c.clipRect(62, 20, 138, 130);
++            p.setStyle(Paint.Style.STROKE);
++            p.setStrokeWidth(1.5f);
++            p.setColor(0xFFC9D4E8);
++            p.setAlpha(110);
++            for (float y = 32; y < 130; y += 9) {
++                c.drawLine(62, y, 138, y, p);
++            }
++            for (float x = 70; x < 138; x += 9) {
++                c.drawLine(x, 20, x, 130, p);
++            }
++            p.setAlpha(255);
++            c.restore();
++
++            // neon ring and neck
++            p.setStyle(Paint.Style.FILL);
++            p.setColor(accent);
++            rect.set(66, 124, 134, 136);
++            c.drawRoundRect(rect, 6, 6, p);
++            p.setColor(0xFF2A3345);
++            rect.set(80, 136, 120, 160);
++            c.drawRoundRect(rect, 6, 6, p);
++
++            // LIVE / MUTED pill
++            String label = LocaleController.getString(live ? R.string.FightModeLive : R.string.FightModeMuted);
++            p.setStyle(Paint.Style.FILL);
++            p.setColor(live ? HOT : 0xFF2A3345);
++            rect.set(66, 244, 134, 262);
++            c.drawRoundRect(rect, 9, 9, p);
++            p.setColor(TEXT);
++            p.setTextAlign(Paint.Align.CENTER);
++            p.setTypeface(Typeface.DEFAULT_BOLD);
++            p.setTextSize(12);
++            c.drawText(label, 100, 257, p);
++            p.setTextAlign(Paint.Align.LEFT);
++            p.setTypeface(Typeface.DEFAULT);
++
++            c.restore();
++        }
++    }
++
++    /** Horizontal or vertical slider with a dark track and a cyan fill. value is 0..1. */
++    private static class SliderView extends View {
++        interface Listener {
++            void onChanged(float value, boolean fromUser);
++
++            void onStop();
++        }
++
++        private final boolean vertical;
++        private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
++        private float value;
++        private Listener listener;
++
++        SliderView(Context context, boolean vertical) {
++            super(context);
++            this.vertical = vertical;
++            p.setStrokeCap(Paint.Cap.ROUND);
++        }
++
++        void setListener(Listener l) {
++            listener = l;
++        }
++
++        void setValue(float v) {
++            value = Math.min(Math.max(v, 0f), 1f);
++            invalidate();
++        }
++
++        @Override
++        protected void onDraw(Canvas c) {
++            float pad = dp(12);
++            float w = getWidth(), h = getHeight();
++            float x0, y0, x1, y1, tx, ty;
++            if (vertical) {
++                x0 = x1 = w / 2f;
++                y0 = h - pad;
++                y1 = pad;
++                tx = x0;
++                ty = y0 + (y1 - y0) * value;
++            } else {
++                y0 = y1 = h / 2f;
++                x0 = pad;
++                x1 = w - pad;
++                ty = y0;
++                tx = x0 + (x1 - x0) * value;
++            }
++            p.setStyle(Paint.Style.STROKE);
++            p.setStrokeWidth(dp(4));
++            p.setColor(0xFF263148);
++            c.drawLine(x0, y0, x1, y1, p);
++            p.setColor(CYAN);
++            c.drawLine(x0, y0, tx, ty, p);
++            p.setStyle(Paint.Style.FILL);
++            p.setColor(CYAN);
++            p.setAlpha(70);
++            c.drawCircle(tx, ty, dp(12), p);
++            p.setAlpha(255);
++            p.setColor(TEXT);
++            c.drawCircle(tx, ty, dp(8), p);
++        }
++
++        @SuppressLint("ClickableViewAccessibility")
++        @Override
++        public boolean onTouchEvent(MotionEvent e) {
++            switch (e.getActionMasked()) {
++                case MotionEvent.ACTION_DOWN:
++                    if (getParent() != null) {
++                        getParent().requestDisallowInterceptTouchEvent(true);
++                    }
++                    update(e);
++                    return true;
++                case MotionEvent.ACTION_MOVE:
++                    update(e);
++                    return true;
++                case MotionEvent.ACTION_UP:
++                case MotionEvent.ACTION_CANCEL:
++                    update(e);
++                    if (listener != null) {
++                        listener.onStop();
++                    }
++                    return true;
++            }
++            return super.onTouchEvent(e);
++        }
++
++        private void update(MotionEvent e) {
++            float pad = dp(12);
++            float v;
++            if (vertical) {
++                v = (getHeight() - pad - e.getY()) / Math.max(1f, getHeight() - 2 * pad);
++            } else {
++                v = (e.getX() - pad) / Math.max(1f, getWidth() - 2 * pad);
++            }
++            value = Math.min(Math.max(v, 0f), 1f);
++            invalidate();
++            if (listener != null) {
++                listener.onChanged(value, true);
++            }
++        }
++    }
++
++    /** Vertical LED level meter (green, amber, red) with a peak marker: shows the boosted mic level. */
++    private static class LedMeter extends View {
++        private static final int SEGMENTS = 16;
++        private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
++        private final RectF rect = new RectF();
++        private float level;
++        private float peak;
++
++        LedMeter(Context context) {
++            super(context);
++        }
++
++        void setLevel(float l) {
++            level = Math.min(Math.max(l, 0f), 1f);
++            peak = Math.max(level, peak - 0.025f);
++            invalidate();
++        }
++
++        @Override
++        protected void onDraw(Canvas c) {
++            float w = getWidth(), h = getHeight();
++            float gap = dp(2);
++            float segH = (h - gap * (SEGMENTS - 1)) / SEGMENTS;
++            int peakIndex = Math.min(SEGMENTS - 1, (int) (peak * SEGMENTS));
++            for (int i = 0; i < SEGMENTS; i++) {
++                float frac = (i + 1f) / SEGMENTS;
++                int color = frac < 0.62f ? GREEN : (frac < 0.85f ? AMBER : HOT);
++                boolean lit = level * SEGMENTS > i;
++                p.setColor(color);
++                p.setAlpha(lit || (i == peakIndex && peak > 0.03f) ? 255 : 45);
++                float bottom = h - i * (segH + gap);
++                rect.set(0, bottom - segH, w, bottom);
++                c.drawRoundRect(rect, dp(2), dp(2), p);
++            }
++            p.setAlpha(255);
++        }
++    }
++}
+diff --git a/TMessagesProj/src/main/java/org/telegram/ui/DialogsActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/DialogsActivity.java
+index 48ec85b..8b0c9a7 100644
+--- a/TMessagesProj/src/main/java/org/telegram/ui/DialogsActivity.java
++++ b/TMessagesProj/src/main/java/org/telegram/ui/DialogsActivity.java
+@@ -3516,8 +3516,9 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+                 logoDrawable = context.getResources().getDrawable(R.drawable.telegram_logo_2).mutate();
+                 logoDrawable.setBounds(0, dp(2), logoDrawable.getIntrinsicWidth(), dp(2) + logoDrawable.getIntrinsicHeight());
+                 logoDrawable.setColorFilter(getThemedColor(Theme.key_telegram_color_dialogsLogo), PorterDuff.Mode.MULTIPLY);
+-                SpannableStringBuilder ssb = new SpannableStringBuilder(getString(R.string.AppName));
+-                ssb.setSpan(new ImageSpan(logoDrawable), 0, ssb.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
++                // Lord Gram: plain branded title instead of the Telegram wordmark drawable
++                SpannableStringBuilder ssb = new SpannableStringBuilder(context.getResources().getString(R.string.LordGramTitle));
++                ssb.setSpan(new android.text.style.ForegroundColorSpan(getThemedColor(Theme.key_telegram_color_dialogsLogo)), 0, ssb.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                 actionBar.setTitle(ssb, statusDrawable);
+                 updateStatus(UserConfig.getInstance(currentAccount).getCurrentUser(), false);
+             }
+diff --git a/TMessagesProj/src/main/java/org/telegram/ui/GroupCallActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/GroupCallActivity.java
+index 4000f5b..619ef1d 100644
+--- a/TMessagesProj/src/main/java/org/telegram/ui/GroupCallActivity.java
++++ b/TMessagesProj/src/main/java/org/telegram/ui/GroupCallActivity.java
+@@ -123,6 +123,7 @@ import org.telegram.messenger.support.LongSparseIntArray;
+ import org.telegram.messenger.voip.GroupCallMessage;
+ import org.telegram.messenger.voip.GroupCallMessagesController;
+ import org.telegram.messenger.voip.Instance;
++import org.telegram.messenger.voip.FightMode;
+ import org.telegram.messenger.voip.VoIPService;
+ import org.telegram.messenger.voip.VoipAudioManager;
+ import org.telegram.tgnet.ConnectionsManager;
+@@ -199,6 +200,8 @@ import org.telegram.ui.Components.inset.WindowInsetsStateHolder;
+ import org.telegram.ui.Components.conference.message.GroupCallMessageCell;
+ import org.telegram.ui.Components.conference.message.GroupCallMessagesListView;
+ import org.telegram.ui.Components.voip.CellFlickerDrawable;
++import org.telegram.ui.Components.voip.FightModeBubble;
++import org.telegram.ui.Components.voip.FightModeWidget;
+ import org.telegram.ui.Components.conference.GroupCallActivityButtonsLayout;
+ import org.telegram.ui.Components.voip.GroupCallGridCell;
+ import org.telegram.ui.Components.voip.GroupCallMiniTextureView;
+@@ -242,6 +245,7 @@ public class GroupCallActivity extends BottomSheet implements NotificationCenter
+     private static final int noise_item = 11;
+     private static final int comments_enable_item = 12;
+     private static final int comments_disable_item = 13;
++    private static final int fight_mode_item = 14; // Lord Gram
+     private static final int user_item_gap = 0;
+ 
+     private static final int MUTE_BUTTON_STATE_UNMUTE = 0;
+@@ -391,6 +395,10 @@ public class GroupCallActivity extends BottomSheet implements NotificationCenter
+     private final ActionBarMenuSubItem editTitleItem;
+     private ActionBarMenuSubItem soundItem;
+     private final ActionBarMenuSubItem noiseItem;
++    private final ActionBarMenuSubItem fightModeItem; // Lord Gram
++    private FightModeWidget fightModeWidget; // Lord Gram: full panel (only while expanded)
++    private FightModeBubble fightModeBubble; // Lord Gram: round mic, shown while fight mode is ON
++    private View fightModeScrim; // Lord Gram: transparent layer, a tap outside the panel collapses it
+     private final ActionBarMenuSubItem permissionItem;
+     private final ActionBarMenuSubItem recordItem;
+     private final ActionBarMenuSubItem screenItem;
+@@ -1681,6 +1689,12 @@ public class GroupCallActivity extends BottomSheet implements NotificationCenter
+         noiseItem.setIcon(SharedConfig.noiseSupression ? R.drawable.msg_noise_on : R.drawable.msg_noise_off);
+         noiseItem.setSubtext(SharedConfig.noiseSupression ? getString(R.string.VoipNoiseCancellationEnabled) : getString(R.string.VoipNoiseCancellationDisabled));
+ 
++        // Lord Gram: Fight mode item follows the same visibility rules as noise suppression.
++        fightModeItem.setVisibility(noiseItem.getVisibility());
++        VoIPService fightService = VoIPService.getSharedInstance();
++        boolean fightOn = fightService != null && fightService.isFightModeEnabled();
++        fightModeItem.setSubtext(fightOn ? getString(R.string.VoipNoiseCancellationEnabled) : getString(R.string.VoipNoiseCancellationDisabled));
++
+         if (canManageCall()) {
+             leaveItem.setVisibility(View.VISIBLE);
+             editTitleItem.setVisibility(View.VISIBLE);
+@@ -2159,6 +2173,7 @@ public class GroupCallActivity extends BottomSheet implements NotificationCenter
+                     accountSelectCell.setVisibility(View.GONE);
+                     soundItem.setVisibility(View.GONE);
+                     noiseItem.setVisibility(View.GONE);
++                    fightModeItem.setVisibility(View.GONE);
+                     otherItem.forceUpdatePopupPosition();
+                 } else if (id == edit_item) {
+                     enterEventSent = false;
+@@ -2304,6 +2319,12 @@ public class GroupCallActivity extends BottomSheet implements NotificationCenter
+                         return;
+                     }
+                     service.setNoiseSupressionEnabled(SharedConfig.noiseSupression);
++                } else if (id == fight_mode_item) {
++                    VoIPService service = VoIPService.getSharedInstance();
++                    if (service == null) {
++                        return;
++                    }
++                    setFightModeActive(!service.isFightModeEnabled());
+                 } else if (id == sound_item) {
+                     VoIPService service = VoIPService.getSharedInstance();
+                     if (service == null) {
+@@ -4884,6 +4905,9 @@ public class GroupCallActivity extends BottomSheet implements NotificationCenter
+         noiseItem = otherItem.addSubItem(noise_item, R.drawable.msg_noise_on, null, getString(R.string.VoipNoiseCancellation), true, false);
+         noiseItem.setItemHeight(56);
+ 
++        fightModeItem = otherItem.addSubItem(fight_mode_item, R.drawable.msg_voice_speaker, null, getString(R.string.FightMode), true, false);
++        fightModeItem.setItemHeight(56);
++
+         soundItemDivider = otherItem.addDivider(ColorUtils.blendARGB(Theme.getColor(Theme.key_voipgroup_actionBar), Color.BLACK, 0.3f));
+         ((ViewGroup.MarginLayoutParams) soundItemDivider.getLayoutParams()).topMargin = 0;
+         ((ViewGroup.MarginLayoutParams) soundItemDivider.getLayoutParams()).bottomMargin = 0;
+@@ -4906,6 +4930,14 @@ public class GroupCallActivity extends BottomSheet implements NotificationCenter
+         disableComments.setColors(Theme.getColor(Theme.key_voipgroup_actionBarItems), Theme.getColor(Theme.key_voipgroup_actionBarItems));
+         soundItem.setColors(Theme.getColor(Theme.key_voipgroup_actionBarItems), Theme.getColor(Theme.key_voipgroup_actionBarItems));
+         noiseItem.setColors(Theme.getColor(Theme.key_voipgroup_actionBarItems), Theme.getColor(Theme.key_voipgroup_actionBarItems));
++        fightModeItem.setColors(Theme.getColor(Theme.key_voipgroup_actionBarItems), Theme.getColor(Theme.key_voipgroup_actionBarItems));
++        AndroidUtilities.runOnUIThread(() -> {
++            VoIPService fightService = VoIPService.getSharedInstance();
++            if (fightService != null && fightService.isFightModeEnabled()) {
++                FightMode.load();
++                showFightModeWidget(true); // Lord Gram: fight mode is still ON, show its controls again
++            }
++        });
+         leaveItem.setColors(Theme.getColor(Theme.key_voipgroup_leaveCallMenu), Theme.getColor(Theme.key_voipgroup_leaveCallMenu));
+         inviteItem.setColors(Theme.getColor(Theme.key_voipgroup_actionBarItems), Theme.getColor(Theme.key_voipgroup_actionBarItems));
+         editTitleItem.setColors(Theme.getColor(Theme.key_voipgroup_actionBarItems), Theme.getColor(Theme.key_voipgroup_actionBarItems));
+@@ -7213,8 +7245,74 @@ public class GroupCallActivity extends BottomSheet implements NotificationCenter
+         }
+     }
+ 
++    /** Lord Gram: turn Fight mode on/off (only from the 3-dot menu). It stays on until the user switches it off. */
++    private void setFightModeActive(boolean active) {
++        VoIPService service = VoIPService.getSharedInstance();
++        if (service == null) {
++            return;
++        }
++        FightMode.load();
++        service.setFightMode(active);
++        showFightModeWidget(active);
++        fightModeItem.setSubtext(active ? getString(R.string.VoipNoiseCancellationEnabled) : getString(R.string.VoipNoiseCancellationDisabled));
++    }
++
++    /** show = round mic bubble (collapsed). hide = remove bubble, panel and scrim. */
++    private void showFightModeWidget(boolean show) {
++        if (show) {
++            if (fightModeBubble == null && containerView != null) {
++                fightModeBubble = new FightModeBubble(getContext(), this::expandFightMode);
++                containerView.addView(fightModeBubble, LayoutHelper.createFrame(56, 56, Gravity.TOP | Gravity.END, 0, 90, 12, 0));
++            }
++        } else {
++            collapseFightMode();
++            if (fightModeBubble != null) {
++                if (fightModeBubble.getParent() instanceof ViewGroup) {
++                    ((ViewGroup) fightModeBubble.getParent()).removeView(fightModeBubble);
++                }
++                fightModeBubble = null;
++            }
++        }
++    }
++
++    private void expandFightMode() {
++        if (containerView == null || fightModeWidget != null) {
++            return;
++        }
++        fightModeScrim = new View(getContext());
++        fightModeScrim.setOnClickListener(v -> collapseFightMode());
++        containerView.addView(fightModeScrim, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.MATCH_PARENT));
++        fightModeWidget = new FightModeWidget(getContext(), this::collapseFightMode);
++        containerView.addView(fightModeWidget, LayoutHelper.createFrame(300, LayoutHelper.WRAP_CONTENT, Gravity.TOP | Gravity.END, 0, 90, 8, 0));
++        if (fightModeBubble != null) {
++            fightModeBubble.setVisibility(View.GONE);
++        }
++    }
++
++    /** Closes the panel but keeps the round mic (fight mode itself stays ON). */
++    private void collapseFightMode() {
++        if (fightModeWidget != null) {
++            if (fightModeWidget.getParent() instanceof ViewGroup) {
++                ((ViewGroup) fightModeWidget.getParent()).removeView(fightModeWidget);
++            }
++            fightModeWidget = null;
++        }
++        if (fightModeScrim != null) {
++            if (fightModeScrim.getParent() instanceof ViewGroup) {
++                ((ViewGroup) fightModeScrim.getParent()).removeView(fightModeScrim);
++            }
++            fightModeScrim = null;
++        }
++        if (fightModeBubble != null) {
++            fightModeBubble.setVisibility(View.VISIBLE);
++        }
++    }
++
+     @Override
+     public void onAudioSettingsChanged() {
++        if (fightModeWidget != null) {
++            fightModeWidget.refresh();
++        }
+         updateSpeakerPhoneIcon(true);
+         if (VoIPService.getSharedInstance() == null || VoIPService.getSharedInstance().isMicMute()) {
+             setMicAmplitude(0f);
+diff --git a/TMessagesProj/src/main/java/org/webrtc/voiceengine/WebRtcAudioRecord.java b/TMessagesProj/src/main/java/org/webrtc/voiceengine/WebRtcAudioRecord.java
+index 5ea67a8..cf5300f 100644
+--- a/TMessagesProj/src/main/java/org/webrtc/voiceengine/WebRtcAudioRecord.java
++++ b/TMessagesProj/src/main/java/org/webrtc/voiceengine/WebRtcAudioRecord.java
+@@ -63,7 +63,7 @@ public class WebRtcAudioRecord {
+   private ByteBuffer byteBuffer;
+   private ByteBuffer deviceByteBuffer;
+ 
+-  private @Nullable AudioRecord audioRecord;
++  private volatile @Nullable AudioRecord audioRecord;
+   private @Nullable AudioRecord deviceAudioRecord;
+   private @Nullable AudioRecordThread audioThread;
+ 
+@@ -246,9 +246,15 @@ public class WebRtcAudioRecord {
+     if (captureType == 2 && Instance == null) {
+       Instance = this;
+     }
++    if (captureType == 0) {
++      micInstance = this; // Lord Gram: lets the app switch the microphone source during a call
++    }
+   }
+ 
+   private void onDestroy() {
++    if (micInstance == this) {
++      micInstance = null;
++    }
+     stopDeviceAudioRecord();
+     if (Instance == this) {
+       Instance = null;
+@@ -502,6 +508,100 @@ public class WebRtcAudioRecord {
+     return AudioSource.VOICE_COMMUNICATION;
+   }
+ 
++  // ---- Lord Gram: change the microphone source (Default / Cam / Voice / Mic / Call) while a call is running ----
++  private static volatile WebRtcAudioRecord micInstance;
++
++  /** The source used for the next (re)start of the recorder. */
++  public static int getAudioSource() {
++    return audioSource;
++  }
++
++  /** Back to the normal call source (VOICE_COMMUNICATION). Used when a call ends. */
++  public static void resetAudioSource() {
++    audioSource = DEFAULT_AUDIO_SOURCE;
++  }
++
++  /**
++   * Switches the source now if the microphone is recording (about 0.2 s of silence, the mute state is kept),
++   * otherwise only remembers it for the next start. Blocks for a short moment: call it from a background thread.
++   * Returns true when the running recorder now uses the new source.
++   */
++  public static boolean switchAudioSource(int source) {
++    WebRtcAudioRecord rec = micInstance;
++    if (rec == null) {
++      audioSource = source;
++      return false;
++    }
++    return rec.switchSourceInternal(source);
++  }
++
++  private synchronized boolean switchSourceInternal(int source) {
++    if (captureType != 0 || audioRecord == null || audioThread == null) {
++      audioSource = source; // not recording right now: it is used at the next init
++      return false;
++    }
++    if (audioSource == source) {
++      return true;
++    }
++    final int oldSource = audioSource;
++    Logging.w(TAG, "switching microphone source " + oldSource + " -> " + source);
++
++    // stop the reader thread and the old AudioRecord
++    audioThread.stopThread();
++    if (!ThreadUtils.joinUninterruptibly(audioThread, AUDIO_RECORD_THREAD_JOIN_TIMEOUT_MS)) {
++      Logging.e(TAG, "Join of AudioRecordJavaThread timed out");
++    }
++    audioThread = null;
++    try {
++      audioRecord.stop();
++    } catch (Throwable e) {
++      FileLog.e(e);
++    }
++    if (effects != null) {
++      effects.release();
++    }
++    releaseAudioResources(false);
++
++    if (createMicRecord(source) && startRecording()) {
++      audioSource = source;
++      return true;
++    }
++
++    // the new source did not work on this phone: go back, so the call never loses its microphone
++    releaseAudioResources(false);
++    if (createMicRecord(oldSource)) {
++      startRecording();
++    }
++    audioSource = oldSource;
++    return false;
++  }
++
++  private boolean createMicRecord(int source) {
++    final int channelConfig = channelCountToConfiguration(requestedChannels);
++    int minBufferSize =
++        AudioRecord.getMinBufferSize(requestedSampleRate, channelConfig, AudioFormat.ENCODING_PCM_16BIT);
++    if (minBufferSize == AudioRecord.ERROR || minBufferSize == AudioRecord.ERROR_BAD_VALUE) {
++      return false;
++    }
++    int bufferSizeInBytes = Math.max(BUFFER_SIZE_FACTOR * minBufferSize, byteBuffer.capacity());
++    try {
++      audioRecord = new AudioRecord(source, requestedSampleRate, channelConfig,
++              AudioFormat.ENCODING_PCM_16BIT, bufferSizeInBytes);
++    } catch (IllegalArgumentException | SecurityException e) {
++      FileLog.e(e);
++      audioRecord = null;
++      return false;
++    }
++    if (audioRecord.getState() != AudioRecord.STATE_INITIALIZED) {
++      releaseAudioResources(false);
++      return false;
++    }
++    if (effects != null) {
++      effects.enable(audioRecord.getAudioSessionId());
++    }
++    return true;
++  }
++
+   // Sets all recorded samples to zero if |mute| is true, i.e., ensures that
+   // the microphone is muted.
+   public static void setMicrophoneMute(boolean mute) {
+diff --git a/TMessagesProj/src/main/res/values/strings.xml b/TMessagesProj/src/main/res/values/strings.xml
+index db9de75..9d180b9 100644
+--- a/TMessagesProj/src/main/res/values/strings.xml
++++ b/TMessagesProj/src/main/res/values/strings.xml
+@@ -4589,6 +4589,29 @@
+     <string name="VoipNoiseCancellation">Noise suppression</string>
+     <string name="VoipNoiseCancellationEnabled">Enabled</string>
+     <string name="VoipNoiseCancellationDisabled">Disabled</string>
++    <string name="FightMode">Fight mode</string>
++    <string name="LordGramTitle">𝗟𝗢𝗥𝗗\'𝗦 𝗚𝗥𝗔𝗠</string>
++    <string name="FightModeLoudness">Loudness</string>
++    <string name="FightModeMicrophone">Microphone</string>
++    <string name="FightModeGain">Gain</string>
++    <string name="FightModePhonic">Phonic</string>
++    <string name="FightModeEqualizer">Equalizer</string>
++    <string name="FightModeMicGain">Microphone Gain</string>
++    <string name="FightModePresets">Presets</string>
++    <string name="FightModeReset">Reset</string>
++    <string name="FightModeMono">Mono</string>
++    <string name="FightModeCustom">Custom</string>
++    <string name="FightModePhonicInfo">Voice chat sends mono audio</string>
++    <string name="FightModeMicLive">Mic is live: tap the mic to mute</string>
++    <string name="FightModeMicMuted">Mic is muted: tap the mic to speak</string>
++    <string name="FightModeVolume">Volume</string>
++    <string name="FightModeVoice">Voice</string>
++    <string name="FightModeVoiceBoost">Voice Boost</string>
++    <string name="FightModeClarity">Clarity</string>
++    <string name="FightModePunch">Punch</string>
++    <string name="FightModeVoiceHint">Clarity = words cut through. Punch = quiet and loud words become equal, so the voice sounds louder.</string>
++    <string name="FightModeLive">LIVE</string>
++    <string name="FightModeMuted">MUTED</string>
+     <string name="VoipVideoNotAvailable">Video is only available\nfor the first %1$s</string>
+     <string name="VoipVideoNotAvailableAdmin">The video chat has over %1$s.\nNew participants must use the latest version of Telegram to view video.</string>
+     <string name="VoipChannelVideoNotAvailableAdmin">The live stream is over %1$s.\nNew participants must use the latest version of Telegram to view video.</string>

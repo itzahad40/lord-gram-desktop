@@ -1,0 +1,132 @@
+name: Build Lord Gram Desktop (Windows x64)
+on: workflow_dispatch
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    env:
+      PREPARE_PATH: Telegram/build/prepare/prepare.py
+    defaults:
+      run:
+        shell: cmd
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check secrets
+        shell: bash
+        env:
+          A: ${{ secrets.LG_API_ID }}
+          B: ${{ secrets.LG_API_HASH }}
+        run: |
+          bad=0
+          if [ -n "$A" ]; then echo "LG_API_ID: SET"; else echo "LG_API_ID: EMPTY"; bad=1; fi
+          if [ -n "$B" ]; then echo "LG_API_HASH: SET"; else echo "LG_API_HASH: EMPTY"; bad=1; fi
+          exit $bad
+
+      - name: Prepare directories
+        run: |
+          mkdir %userprofile%\TBuild\Libraries
+          mklink /d %GITHUB_WORKSPACE%\TBuild %userprofile%\TBuild
+          echo TBUILD=%GITHUB_WORKSPACE%\TBuild>>%GITHUB_ENV%
+          echo LibrariesPath=%GITHUB_WORKSPACE%\TBuild\Libraries\win64>>%GITHUB_ENV%
+
+      - name: Fetch Telegram Desktop, patch, rebrand
+        shell: bash
+        env:
+          LG_APP_NAME: ${{ secrets.LG_APP_NAME }}
+        run: |
+          python -m pip install --quiet pillow
+          git config --global user.email "ci@example.com"
+          git config --global user.name "ci"
+          bash desktop/scripts/setup_desktop.sh "$GITHUB_WORKSPACE/TBuild/tdesktop"
+
+      - name: Read SDK version
+        shell: bash
+        run: |
+          DOCPATH=$GITHUB_WORKSPACE/TBuild/tdesktop/docs/building-win.md
+          SDK="$(grep "SDK version" $DOCPATH | sed -r 's/.*\*\*(.*)\*\* SDK version.*/\1/')"
+          echo "SDK=$SDK" >> $GITHUB_ENV
+          sed -i '/CMAKE_${lang}_FLAGS_DEBUG_INIT/s/${_Zi}//' "$PROGRAMFILES"/CMake/share/cmake*/Modules/Platform/Windows-MSVC.cmake
+          echo "$(sha256sum $GITHUB_WORKSPACE/TBuild/tdesktop/$PREPARE_PATH | awk '{ print $1 }')" >> CACHE_KEY.txt
+          echo "$SDK" >> CACHE_KEY.txt
+          echo "CACHE_KEY=$(sha256sum CACHE_KEY.txt | awk '{ print $1 }')" >> $GITHUB_ENV
+
+      - uses: Eden-CI/msvc-dev-cmd@master
+        name: Native Tools Command Prompt
+        with:
+          arch: x64
+          sdk: ${{ env.SDK }}
+          toolset: "14.44"
+
+      - name: NuGet sources
+        run: |
+          nuget sources Disable -Name "Microsoft Visual Studio Offline Packages"
+          nuget sources Add -Source https://api.nuget.org/v3/index.json & exit 0
+
+      - name: ThirdParty cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.TBUILD }}\ThirdParty
+          key: lg-win-third-party-${{ env.CACHE_KEY }}
+          restore-keys: lg-win-third-party-
+
+      - name: Libraries cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.LibrariesPath }}\*
+            !${{ env.LibrariesPath }}\cache_keys
+            !${{ env.LibrariesPath }}\[qQ]t[_-]*
+            ${{ env.LibrariesPath }}\cache_keys\*
+            !${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
+          key: lg-win-libs-${{ env.CACHE_KEY }}
+          restore-keys: lg-win-libs-
+
+      - name: Qt cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.LibrariesPath }}\[qQ]t[_-]*
+            ${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
+          key: lg-win-qt6-${{ env.CACHE_KEY }}
+          restore-keys: lg-win-qt6-
+
+      - name: Libraries
+        run: |
+          %TBUILD%\tdesktop\Telegram\build\prepare\win.bat skip-release silent qt6
+
+      - name: Free up some disk space
+        shell: bash
+        run: find $LibrariesPath '(' '(' ! '(' -name '*.lib' -o -name '*.a' -o -name '*.exe' -o -name '*.h' -o -name '*.hpp' -o -name '*.inc' -o -name '*.cmake' -o -path '*/include/*' -o -path '*/objects-*' -o -path '*/cache_keys/*' -o -path '*/patches/*' ')' -type f ')' -o -empty ')' -delete
+
+      - name: Build Lord Gram
+        env:
+          LG_API_ID: ${{ secrets.LG_API_ID }}
+          LG_API_HASH: ${{ secrets.LG_API_HASH }}
+        run: |
+          cd %TBUILD%\tdesktop\Telegram
+
+          call configure.bat ^
+          x64 ^
+          qt6 ^
+          -D TDESKTOP_API_ID=%LG_API_ID% ^
+          -D TDESKTOP_API_HASH=%LG_API_HASH% ^
+          -D CMAKE_CONFIGURATION_TYPES=Debug ^
+          -D CMAKE_MSVC_DEBUG_INFORMATION_FORMAT= ^
+          -D DESKTOP_APP_DISABLE_AUTOUPDATE=ON ^
+          -D DESKTOP_APP_DISABLE_CRASH_REPORTS=ON
+
+          cmake --build ..\out --config Debug --parallel
+
+      - name: Collect artifact
+        run: |
+          mkdir artifact
+          move %TBUILD%\tdesktop\out\Debug\Telegram.exe artifact\
+
+      - uses: actions/upload-artifact@v4
+        name: Upload artifact
+        with:
+          name: LordGram-Windows-x64
+          path: artifact\

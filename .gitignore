@@ -1,0 +1,6 @@
+lordgram.config
+signing.env
+*.keystore
+build-src/
+
+build-desktop/

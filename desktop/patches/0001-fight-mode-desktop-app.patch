@@ -1,0 +1,872 @@
+diff --git a/Telegram/CMakeLists.txt b/Telegram/CMakeLists.txt
+index ef6d3ed..860c377 100644
+--- a/Telegram/CMakeLists.txt
++++ b/Telegram/CMakeLists.txt
+@@ -407,6 +407,8 @@ PRIVATE
+     calls/group/calls_group_members.h
+     calls/group/calls_group_members_row.cpp
+     calls/group/calls_group_members_row.h
++    calls/group/calls_group_fight_mode.cpp
++    calls/group/calls_group_fight_mode.h
+     calls/group/calls_group_menu.cpp
+     calls/group/calls_group_menu.h
+     calls/group/calls_group_message_encryption.cpp
+diff --git a/Telegram/SourceFiles/calls/calls.style b/Telegram/SourceFiles/calls/calls.style
+index cb6c742..1bf0826 100644
+--- a/Telegram/SourceFiles/calls/calls.style
++++ b/Telegram/SourceFiles/calls/calls.style
+@@ -1156,6 +1156,39 @@ groupCallDelaySlider: MediaSlider(defaultContinuousSlider) {
+ 	receivedTillFg: groupCallMemberNotJoinedStatus;
+ }
+ groupCallDelayMargin: margins(22px, 5px, 20px, 10px);
++groupCallFightModeWidth: 900px;
++groupCallFightModeHeight: 500px;
++groupCallFightModePadding: 16px;
++groupCallFightModeGap: 14px;
++groupCallFightModeLeftWidth: 260px;
++groupCallFightModeRadius: 14px;
++groupCallFightModeBorder: 1px;
++groupCallFightModeLogoSize: 168px;
++groupCallFightModeLogoTop: 26px;
++groupCallFightModeRingWidth: 4px;
++groupCallFightModeTitleHeight: 36px;
++groupCallFightModeSubtitleHeight: 20px;
++groupCallFightModeSubtitleSpacing: 5px;
++groupCallFightModeGlow: 2px;
++groupCallFightModeButtonHeight: 42px;
++groupCallFightModeSpectrumHeight: 122px;
++groupCallFightModeSpectrumHeader: 26px;
++groupCallFightModeBarWidth: 5px;
++groupCallFightModeBarGap: 2px;
++groupCallFightModeBarMinHeight: 2px;
++groupCallFightModeHeaderHeight: 44px;
++groupCallFightModeHeaderMarkWidth: 4px;
++groupCallFightModeHeaderMarkHeight: 14px;
++groupCallFightModeRowHeight: 58px;
++groupCallFightModeRowTitleHeight: 22px;
++groupCallFightModeSliderTop: 28px;
++groupCallFightModeTipHeight: 26px;
++groupCallFightModeTitleFont: font(26px semibold);
++groupCallFightModeLabelFont: font(11px semibold);
++groupCallFightModeSmallFont: font(10px semibold);
++groupCallFightModeSlider: MediaSlider(groupCallDelaySlider) {
++	seekSize: size(16px, 16px);
++}
+ 
+ groupCallTitleButton: IconButton {
+ 	width: windowTitleButtonWidth;
+diff --git a/Telegram/SourceFiles/calls/group/calls_group_call.cpp b/Telegram/SourceFiles/calls/group/calls_group_call.cpp
+index 70be0e3..e504da4 100644
+--- a/Telegram/SourceFiles/calls/group/calls_group_call.cpp
++++ b/Telegram/SourceFiles/calls/group/calls_group_call.cpp
+@@ -2280,6 +2280,16 @@ void GroupCall::toggleScheduleStartSubscribed(bool subscribed) {
+ 	}).send();
+ }
+ 
++void GroupCall::setFightMode(const FightModeSettings &settings) {
++	if (_instance) {
++		_instance->setFightMode(
++			settings.enabled,
++			settings.gainDb,
++			settings.volume,
++			settings.packed());
++	}
++}
++
+ void GroupCall::setNoiseSuppression(bool enabled) {
+ 	if (_instance) {
+ 		_instance->setIsNoiseSuppressionEnabled(enabled);
+@@ -3146,6 +3156,7 @@ bool GroupCall::tryCreateController() {
+ 	_instance = std::make_unique<tgcalls::GroupInstanceCustomImpl>(
+ 		std::move(descriptor));
+ 
++	setFightMode(FightModeShared());
+ 	updateInstanceMuteState();
+ 	updateInstanceVolumes();
+ 	for (auto &[endpoint, sink] : base::take(_pendingVideoOutputs)) {
+diff --git a/Telegram/SourceFiles/calls/group/calls_group_call.h b/Telegram/SourceFiles/calls/group/calls_group_call.h
+index 4e63e93..13b03ca 100644
+--- a/Telegram/SourceFiles/calls/group/calls_group_call.h
++++ b/Telegram/SourceFiles/calls/group/calls_group_call.h
+@@ -14,6 +14,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ #include "mtproto/mtproto_auth_key.h"
+ #include "webrtc/webrtc_device_common.h"
+ #include "webrtc/webrtc_device_resolver.h"
++#include "calls/group/calls_group_fight_mode.h"
+ 
+ class History;
+ 
+@@ -304,6 +305,7 @@ public:
+ 	void startScheduledNow();
+ 	void toggleScheduleStartSubscribed(bool subscribed);
+ 	void setNoiseSuppression(bool enabled);
++	void setFightMode(const FightModeSettings &settings);
+ 	void removeConferenceParticipants(
+ 		const base::flat_set<UserId> userIds,
+ 		bool removingStale = false);
+diff --git a/Telegram/SourceFiles/calls/group/calls_group_fight_mode.cpp b/Telegram/SourceFiles/calls/group/calls_group_fight_mode.cpp
+new file mode 100644
+index 0000000..dec5343
+--- /dev/null
++++ b/Telegram/SourceFiles/calls/group/calls_group_fight_mode.cpp
+@@ -0,0 +1,679 @@
++/*
++This file is part of Lord Gram, an unofficial Telegram Desktop client.
++Licensed under GPLv3 with the same exceptions as Telegram Desktop.
++*/
++#include "calls/group/calls_group_fight_mode.h"
++
++#include "calls/group/calls_group_call.h"
++#include "calls/calls_instance.h"
++#include "core/application.h"
++#include "core/core_settings.h"
++#include "base/timer.h"
++#include "ui/abstract_button.h"
++#include "ui/painter.h"
++#include "ui/rp_widget.h"
++#include "ui/widgets/continuous_sliders.h"
++#include "styles/style_calls.h"
++#include "styles/style_layers.h"
++
++#include <tgcalls/group/GroupInstanceCustomImpl.h>
++
++#include <QtCore/QSettings>
++#include <QtGui/QImage>
++#include <QtGui/QLinearGradient>
++#include <QtGui/QPainterPath>
++#include <QtGui/QRadialGradient>
++
++#include <cmath>
++
++namespace Calls::Group {
++namespace {
++
++constexpr auto kMaxGainDb = 100.f;
++constexpr auto kMaxEqDb = 12.f;
++constexpr auto kEqBands = 6;
++constexpr auto kBars = 32;
++constexpr auto kLevelInterval = crl::time(50);
++constexpr auto kBlinkInterval = crl::time(600);
++constexpr auto kFirstColumnRows = 5;
++constexpr auto kRackRowsBeforeEq = 3;
++
++constexpr auto kEqTitles = std::array<const char*, kEqBands>{
++	"BASS  60 Hz",
++	"LOW-MID  400 Hz",
++	"MID  1 kHz",
++	"PRESENCE  2.5 kHz",
++	"SHARPNESS  6.3 kHz",
++	"TREBLE  16 kHz",
++};
++
++const auto kCardBg = QColor(11, 11, 16);
++const auto kPanelBorder = QColor(120, 14, 30);
++const auto kRed = QColor(255, 31, 61);
++const auto kRedBright = QColor(255, 74, 94);
++const auto kOrange = QColor(255, 138, 42);
++const auto kText = QColor(236, 236, 242);
++const auto kMuted = QColor(130, 130, 146);
++const auto kTrack = QColor(42, 42, 54);
++const auto kButtonBg = QColor(26, 26, 36);
++const auto kButtonOver = QColor(40, 40, 54);
++const auto kWhite = QColor(255, 255, 255);
++const auto kInk = QColor(14, 14, 20);
++
++enum class ButtonKind {
++	Primary,
++	Danger,
++	Plain,
++};
++
++using SetValue = Fn<void(float64)>;
++
++[[nodiscard]] QString SettingsPath() {
++	return cWorkingDir() + u"tdata/lordgram_fightmode.ini"_q;
++}
++
++[[nodiscard]] float Clamped(float value, float min, float max) {
++	return std::clamp(value, min, max);
++}
++
++void PaintCard(QPainter &p, const QRect &rect) {
++	auto hq = PainterHighQualityEnabler(p);
++	p.setPen(QPen(kPanelBorder, st::groupCallFightModeBorder));
++	p.setBrush(kCardBg);
++	p.drawRoundedRect(
++		QRectF(rect).adjusted(0.5, 0.5, -0.5, -0.5),
++		st::groupCallFightModeRadius,
++		st::groupCallFightModeRadius);
++}
++
++[[nodiscard]] not_null<Ui::AbstractButton*> AddButton(
++		not_null<Ui::RpWidget*> parent,
++		const QRect &geometry,
++		rpl::producer<QString> text,
++		ButtonKind kind,
++		Fn<bool()> active,
++		Fn<void()> callback) {
++	const auto button = Ui::CreateChild<Ui::AbstractButton>(parent.get());
++	button->setGeometry(geometry);
++	const auto label = button->lifetime().make_state<QString>();
++	std::move(text) | rpl::on_next([=](QString value) {
++		*label = value;
++		button->update();
++	}, button->lifetime());
++	button->paintOn([=](QPainter &p) {
++		auto hq = PainterHighQualityEnabler(p);
++		const auto on = active && active();
++		const auto over = button->isOver();
++		const auto radius = button->height() / 2.;
++		auto fill = kButtonBg;
++		auto border = kPanelBorder;
++		auto ink = kText;
++		if (kind == ButtonKind::Primary) {
++			fill = on ? kRed : (over ? QColor(225, 225, 230) : kWhite);
++			border = fill;
++			ink = on ? kWhite : kInk;
++		} else if (kind == ButtonKind::Danger) {
++			fill = over ? QColor(170, 12, 36) : QColor(140, 8, 28);
++			border = kRed;
++			ink = kWhite;
++		} else {
++			fill = over ? kButtonOver : kButtonBg;
++			border = on ? kOrange : kPanelBorder;
++			ink = on ? kOrange : kText;
++		}
++		p.setPen(QPen(border, st::groupCallFightModeBorder));
++		p.setBrush(fill);
++		p.drawRoundedRect(
++			QRectF(button->rect()).adjusted(0.5, 0.5, -0.5, -0.5),
++			radius,
++			radius);
++		p.setPen(ink);
++		p.setFont(st::groupCallFightModeLabelFont->f);
++		p.drawText(button->rect(), Qt::AlignCenter, *label);
++	});
++	button->setClickedCallback(std::move(callback));
++	return button;
++}
++
++[[nodiscard]] SetValue AddRackSlider(
++		not_null<Ui::RpWidget*> parent,
++		const QRect &geometry,
++		const QString &title,
++		float64 current,
++		Fn<QString(float64)> format,
++		Fn<void(float64)> changed,
++		Fn<void()> finished) {
++	const auto row = Ui::CreateChild<Ui::RpWidget>(parent.get());
++	row->setGeometry(geometry);
++	const auto value = row->lifetime().make_state<float64>(current);
++	row->paintOn([=](QPainter &p) {
++		const auto titleRect = QRect(
++			0,
++			0,
++			row->width(),
++			st::groupCallFightModeRowTitleHeight);
++		p.setFont(st::groupCallFightModeLabelFont->f);
++		p.setPen(kText);
++		p.drawText(titleRect, Qt::AlignLeft | Qt::AlignVCenter, title);
++		p.setPen(kOrange);
++		p.drawText(
++			titleRect,
++			Qt::AlignRight | Qt::AlignVCenter,
++			format(*value));
++	});
++	const auto slider = Ui::CreateChild<Ui::MediaSlider>(
++		row,
++		st::groupCallFightModeSlider);
++	slider->setGeometry(
++		0,
++		st::groupCallFightModeSliderTop,
++		geometry.width(),
++		st::groupCallFightModeSlider.seekSize.height());
++	slider->setAlwaysDisplayMarker(true);
++	slider->setValue(current);
++	slider->setColorOverrides({
++		.activeFg = kRed,
++		.seekFg = kWhite,
++		.inactiveFg = kTrack,
++	});
++	slider->setChangeProgressCallback([=](float64 progress) {
++		*value = progress;
++		row->update();
++		changed(progress);
++	});
++	slider->setChangeFinishedCallback([=](float64 progress) {
++		*value = progress;
++		row->update();
++		changed(progress);
++		finished();
++	});
++	return [=](float64 progress) {
++		*value = progress;
++		slider->setValue(progress);
++		row->update();
++	};
++}
++
++} // namespace
++
++std::vector<float> FightModeSettings::packed() const {
++	auto result = std::vector<float>();
++	result.reserve(9);
++	for (const auto value : eqDb) {
++		result.push_back(value);
++	}
++	result.push_back(clarity);
++	result.push_back(punch);
++	result.push_back(broadcast ? 1.f : 0.f);
++	return result;
++}
++
++FightModeSettings LoadFightModeSettings() {
++	auto result = FightModeSettings();
++	auto file = QSettings(SettingsPath(), QSettings::IniFormat);
++	result.gainDb = Clamped(
++		file.value(u"gainDb"_q, 0.).toFloat(),
++		0.f,
++		kMaxGainDb);
++	result.volume = Clamped(file.value(u"volume"_q, 1.).toFloat(), 0.f, 1.f);
++	for (auto i = 0; i != kEqBands; ++i) {
++		result.eqDb[i] = Clamped(
++			file.value(u"eq%1"_q.arg(i), 0.).toFloat(),
++			-kMaxEqDb,
++			kMaxEqDb);
++	}
++	result.clarity = Clamped(file.value(u"clarity"_q, 0.).toFloat(), 0.f, 1.f);
++	result.punch = Clamped(file.value(u"punch"_q, 0.).toFloat(), 0.f, 1.f);
++	result.broadcast = file.value(u"broadcast"_q, false).toBool();
++	return result;
++}
++
++void SaveFightModeSettings(const FightModeSettings &settings) {
++	auto file = QSettings(SettingsPath(), QSettings::IniFormat);
++	file.setValue(u"gainDb"_q, settings.gainDb);
++	file.setValue(u"volume"_q, settings.volume);
++	for (auto i = 0; i != kEqBands; ++i) {
++		file.setValue(u"eq%1"_q.arg(i), settings.eqDb[i]);
++	}
++	file.setValue(u"clarity"_q, settings.clarity);
++	file.setValue(u"punch"_q, settings.punch);
++	file.setValue(u"broadcast"_q, settings.broadcast);
++	file.sync();
++}
++
++FightModeSettings &FightModeShared() {
++	static auto result = LoadFightModeSettings();
++	return result;
++}
++
++void ApplyFightMode() {
++	if (const auto call = Core::App().calls().currentGroupCall()) {
++		call->setFightMode(FightModeShared());
++	}
++}
++
++rpl::producer<QString> FightModeMenuLabel() {
++	return rpl::make_producer<QString>([=](const auto &consumer) {
++		auto lifetime = rpl::lifetime();
++		const auto timer = lifetime.make_state<base::Timer>();
++		const auto phase = lifetime.make_state<bool>(false);
++		const auto push = [=] {
++			if (!FightModeShared().enabled) {
++				consumer.put_next(u"Fight mode"_q);
++				return;
++			}
++			*phase = !*phase;
++			consumer.put_next(*phase
++				? u"Fight mode  \u25CF"_q
++				: u"Fight mode  \u25CB"_q);
++		};
++		timer->setCallback(push);
++		timer->callEach(kBlinkInterval);
++		push();
++		return lifetime;
++	});
++}
++
++void FightModeBox(not_null<Ui::GenericBox*> box) {
++	struct State {
++		FightModeSettings settings;
++		std::array<float, kBars> history = {};
++		QString levelText = u"-- dB"_q;
++		QImage logo = QImage(u":/gui/art/lordgram_fight.png"_q);
++		SetValue gain;
++		SetValue master;
++		SetValue clarity;
++		std::vector<SetValue> eq;
++		rpl::variable<QString> powerText;
++		rpl::variable<QString> broadcastText;
++		base::Timer timer;
++	};
++	const auto state = box->lifetime().make_state<State>();
++	state->settings = FightModeShared();
++
++	const auto apply = [=] {
++		FightModeShared() = state->settings;
++		ApplyFightMode();
++	};
++	const auto save = [=] {
++		SaveFightModeSettings(state->settings);
++	};
++	const auto refreshTexts = [=] {
++		state->powerText = state->settings.enabled
++			? u"FIGHT MODE: ON"_q
++			: u"FIGHT MODE: OFF"_q;
++		state->broadcastText = state->settings.broadcast
++			? u"BROADCAST: ON"_q
++			: u"BROADCAST: OFF"_q;
++	};
++	refreshTexts();
++
++	const auto pad = st::groupCallFightModePadding;
++	const auto gap = st::groupCallFightModeGap;
++	const auto fullWidth = st::groupCallFightModeWidth;
++	const auto panelHeight = st::groupCallFightModeHeight - 2 * pad;
++	const auto leftWidth = st::groupCallFightModeLeftWidth;
++	const auto rightLeft = pad + leftWidth + gap;
++	const auto rightWidth = fullWidth - pad - rightLeft;
++
++	box->setWidth(fullWidth);
++	box->setNoContentMargin(true);
++	const auto root = box->addRow(
++		object_ptr<Ui::RpWidget>(box),
++		style::margins());
++	root->resize(fullWidth, st::groupCallFightModeHeight);
++
++	const auto left = Ui::CreateChild<Ui::RpWidget>(root);
++	left->setGeometry(pad, pad, leftWidth, panelHeight);
++	const auto right = Ui::CreateChild<Ui::RpWidget>(root);
++	right->setGeometry(rightLeft, pad, rightWidth, panelHeight);
++
++	const auto logoSize = st::groupCallFightModeLogoSize;
++	const auto logoTop = st::groupCallFightModeLogoTop;
++	const auto titleTop = logoTop + logoSize + gap;
++	const auto subtitleTop = titleTop + st::groupCallFightModeTitleHeight;
++	const auto powerTop = subtitleTop
++		+ st::groupCallFightModeSubtitleHeight
++		+ gap;
++	const auto spectrumHeight = st::groupCallFightModeSpectrumHeight;
++	const auto spectrumRect = QRect(
++		pad,
++		panelHeight - pad - spectrumHeight,
++		leftWidth - 2 * pad,
++		spectrumHeight);
++
++	left->paintOn([=](QPainter &p) {
++		PaintCard(p, left->rect());
++		auto hq = PainterHighQualityEnabler(p);
++		const auto center = QPointF(
++			left->width() / 2.,
++			logoTop + logoSize / 2.);
++		auto glow = QRadialGradient(center, logoSize * 0.75);
++		glow.setColorAt(0., QColor(255, 31, 61, 110));
++		glow.setColorAt(1., QColor(255, 31, 61, 0));
++		p.setPen(Qt::NoPen);
++		p.setBrush(glow);
++		p.drawEllipse(center, logoSize * 0.75, logoSize * 0.75);
++
++		const auto logoRect = QRectF(
++			center.x() - logoSize / 2.,
++			logoTop,
++			logoSize,
++			logoSize);
++		if (!state->logo.isNull()) {
++			auto path = QPainterPath();
++			path.addEllipse(logoRect);
++			p.save();
++			p.setClipPath(path);
++			p.drawImage(logoRect, state->logo);
++			p.restore();
++		}
++		const auto ring = st::groupCallFightModeRingWidth;
++		p.setPen(QPen(kRed, ring));
++		p.setBrush(Qt::NoBrush);
++		p.drawEllipse(logoRect.adjusted(
++			ring / 2.,
++			ring / 2.,
++			-ring / 2.,
++			-ring / 2.));
++
++		const auto titleRect = QRect(
++			0,
++			titleTop,
++			left->width(),
++			st::groupCallFightModeTitleHeight);
++		const auto title = u"LORD'S GRAM"_q;
++		p.setFont(st::groupCallFightModeTitleFont->f);
++		const auto glowShift = st::groupCallFightModeGlow;
++		p.setPen(QColor(255, 31, 61, 70));
++		for (const auto &shift : {
++			QPoint(-glowShift, 0),
++			QPoint(glowShift, 0),
++			QPoint(0, -glowShift),
++			QPoint(0, glowShift),
++		}) {
++			p.drawText(titleRect.translated(shift), Qt::AlignCenter, title);
++		}
++		p.setPen(kRedBright);
++		p.drawText(titleRect, Qt::AlignCenter, title);
++
++		auto subtitleFont = st::groupCallFightModeSmallFont->f;
++		subtitleFont.setLetterSpacing(
++			QFont::AbsoluteSpacing,
++			st::groupCallFightModeSubtitleSpacing);
++		p.setFont(subtitleFont);
++		p.setPen(kText);
++		p.drawText(
++			QRect(
++				0,
++				subtitleTop,
++				left->width(),
++				st::groupCallFightModeSubtitleHeight),
++			Qt::AlignCenter,
++			u"FIGHT MODE"_q);
++
++		PaintCard(p, spectrumRect);
++		p.setFont(st::groupCallFightModeSmallFont->f);
++		const auto headerRect = QRect(
++			spectrumRect.x() + gap,
++			spectrumRect.y(),
++			spectrumRect.width() - 2 * gap,
++			st::groupCallFightModeSpectrumHeader);
++		p.setPen(kMuted);
++		p.drawText(
++			headerRect,
++			Qt::AlignLeft | Qt::AlignVCenter,
++			u"LIVE MIC LEVEL"_q);
++		p.setPen(kOrange);
++		p.drawText(
++			headerRect,
++			Qt::AlignRight | Qt::AlignVCenter,
++			state->levelText);
++
++		const auto barWidth = st::groupCallFightModeBarWidth;
++		const auto barGap = st::groupCallFightModeBarGap;
++		const auto area = QRect(
++			spectrumRect.x() + gap,
++			spectrumRect.y() + st::groupCallFightModeSpectrumHeader,
++			spectrumRect.width() - 2 * gap,
++			spectrumRect.height()
++				- st::groupCallFightModeSpectrumHeader
++				- gap);
++		auto gradient = QLinearGradient(
++			QPointF(0, area.bottom()),
++			QPointF(0, area.top()));
++		gradient.setColorAt(0., kRed);
++		gradient.setColorAt(1., kOrange);
++		p.setPen(Qt::NoPen);
++		p.setBrush(gradient);
++		const auto step = barWidth + barGap;
++		const auto barsLeft = area.x()
++			+ (area.width() - (kBars * step - barGap)) / 2;
++		for (auto i = 0; i != kBars; ++i) {
++			const auto shaped = std::sqrt(state->history[i]);
++			const auto height = std::max(
++				int(base::SafeRound(shaped * area.height())),
++				int(st::groupCallFightModeBarMinHeight));
++			p.drawRect(
++				barsLeft + i * step,
++				area.bottom() + 1 - height,
++				barWidth,
++				height);
++		}
++	});
++
++	AddButton(
++		left,
++		QRect(
++			pad,
++			powerTop,
++			leftWidth - 2 * pad,
++			st::groupCallFightModeButtonHeight),
++		state->powerText.value(),
++		ButtonKind::Primary,
++		[=] { return state->settings.enabled; },
++		[=] {
++			state->settings.enabled = !state->settings.enabled;
++			refreshTexts();
++			apply();
++		});
++
++	right->paintOn([=](QPainter &p) {
++		PaintCard(p, right->rect());
++		auto hq = PainterHighQualityEnabler(p);
++		const auto markTop = (st::groupCallFightModeHeaderHeight
++			- st::groupCallFightModeHeaderMarkHeight) / 2;
++		p.setPen(Qt::NoPen);
++		p.setBrush(kRed);
++		p.drawRect(
++			pad,
++			markTop,
++			st::groupCallFightModeHeaderMarkWidth,
++			st::groupCallFightModeHeaderMarkHeight);
++		p.setFont(st::groupCallFightModeLabelFont->f);
++		p.setPen(kRedBright);
++		p.drawText(
++			QRect(
++				pad + st::groupCallFightModeHeaderMarkWidth + gap / 2,
++				0,
++				right->width() - 2 * pad,
++				st::groupCallFightModeHeaderHeight),
++			Qt::AlignLeft | Qt::AlignVCenter,
++			u"LIVE EFFECT RACK  -  9 CONTROLS"_q);
++		p.setFont(st::groupCallFightModeSmallFont->f);
++		p.setPen(kOrange);
++		p.drawText(
++			QRect(
++				pad,
++				right->height() - pad - st::groupCallFightModeTipHeight,
++				right->width() - 2 * pad,
++				st::groupCallFightModeTipHeight),
++			Qt::AlignLeft | Qt::AlignVCenter,
++			u"Tip: voice phat-ti ho to GAIN kam karo (20 dB se upar clip hota hai). Headset use karo."_q);
++	});
++
++	const auto columnWidth = (rightWidth - 2 * pad - gap) / 2;
++	const auto rowsTop = st::groupCallFightModeHeaderHeight;
++	const auto rowRect = [=](int column, int row) {
++		return QRect(
++			pad + column * (columnWidth + gap),
++			rowsTop + row * st::groupCallFightModeRowHeight,
++			columnWidth,
++			st::groupCallFightModeRowHeight);
++	};
++	const auto percent = [](float64 value) {
++		return QString::number(qRound(value * 100.)) + u"%"_q;
++	};
++
++	state->gain = AddRackSlider(
++		right,
++		rowRect(0, 0),
++		u"GAIN / PREAMP"_q,
++		state->settings.gainDb / kMaxGainDb,
++		[](float64 value) {
++			return QString::number(qRound(value * kMaxGainDb)) + u" dB"_q;
++		},
++		[=](float64 value) {
++			state->settings.gainDb = float(value) * kMaxGainDb;
++			apply();
++		},
++		save);
++	state->master = AddRackSlider(
++		right,
++		rowRect(0, 1),
++		u"MASTER OUTPUT"_q,
++		state->settings.volume,
++		percent,
++		[=](float64 value) {
++			state->settings.volume = float(value);
++			apply();
++		},
++		save);
++	state->clarity = AddRackSlider(
++		right,
++		rowRect(0, 2),
++		u"CLARITY"_q,
++		state->settings.clarity,
++		percent,
++		[=](float64 value) {
++			state->settings.clarity = float(value);
++			apply();
++		},
++		save);
++	for (auto i = 0; i != kEqBands; ++i) {
++		const auto slot = i + kRackRowsBeforeEq;
++		const auto column = (slot < kFirstColumnRows) ? 0 : 1;
++		const auto row = (column == 0) ? slot : (slot - kFirstColumnRows);
++		state->eq.push_back(AddRackSlider(
++			right,
++			rowRect(column, row),
++			QString::fromLatin1(kEqTitles[i]),
++			(state->settings.eqDb[i] + kMaxEqDb) / (2. * kMaxEqDb),
++			[](float64 value) {
++				const auto db = value * 2. * kMaxEqDb - kMaxEqDb;
++				return QString::number(db, 'f', 1) + u" dB"_q;
++			},
++			[=](float64 value) {
++				state->settings.eqDb[i] = float(value) * 2.f * kMaxEqDb
++					- kMaxEqDb;
++				apply();
++			},
++			save));
++	}
++
++	const auto applyPreset = [=](
++			float gainDb,
++			float clarity,
++			bool broadcast,
++			std::array<float, kEqBands> eq) {
++		auto &settings = state->settings;
++		settings.gainDb = gainDb;
++		settings.volume = 1.f;
++		settings.clarity = clarity;
++		settings.broadcast = broadcast;
++		settings.eqDb = eq;
++		state->gain(gainDb / kMaxGainDb);
++		state->master(1.);
++		state->clarity(clarity);
++		for (auto i = 0; i != kEqBands; ++i) {
++			state->eq[i]((eq[i] + kMaxEqDb) / (2. * kMaxEqDb));
++		}
++		refreshTexts();
++		apply();
++		save();
++	};
++
++	const auto buttonsTop = panelHeight
++		- pad
++		- st::groupCallFightModeTipHeight
++		- st::groupCallFightModeButtonHeight
++		- gap / 2;
++	const auto buttonWidth = (rightWidth - 2 * pad - 3 * gap / 2) / 4;
++	const auto buttonGap = gap / 2;
++	const auto buttonRect = [=](int index) {
++		return QRect(
++			pad + index * (buttonWidth + buttonGap),
++			buttonsTop,
++			buttonWidth,
++			st::groupCallFightModeButtonHeight);
++	};
++	AddButton(
++		right,
++		buttonRect(0),
++		rpl::single(u"BATTLE PRESET"_q),
++		ButtonKind::Danger,
++		nullptr,
++		[=] {
++			applyPreset(20.f, 0.6f, true, { 4.f, -2.f, 0.f, 4.f, 3.f, 0.f });
++		});
++	AddButton(
++		right,
++		buttonRect(1),
++		rpl::single(u"CLEAN PRESET"_q),
++		ButtonKind::Plain,
++		nullptr,
++		[=] {
++			applyPreset(12.f, 0.3f, false, {});
++		});
++	AddButton(
++		right,
++		buttonRect(2),
++		state->broadcastText.value(),
++		ButtonKind::Plain,
++		[=] { return state->settings.broadcast; },
++		[=] {
++			state->settings.broadcast = !state->settings.broadcast;
++			refreshTexts();
++			apply();
++			save();
++		});
++	AddButton(
++		right,
++		buttonRect(3),
++		rpl::single(u"CLOSE"_q),
++		ButtonKind::Plain,
++		nullptr,
++		[=] { box->closeBox(); });
++
++	state->timer.setCallback([=] {
++		auto level = tgcalls::GroupInstanceCustomImpl::getFightModeLevel();
++		if (!state->settings.enabled) {
++			level = 0.f;
++		}
++		std::move(
++			state->history.begin() + 1,
++			state->history.end(),
++			state->history.begin());
++		state->history.back() = level;
++		state->levelText = (level > 0.0001f)
++			? QString::number(20. * std::log10(level), 'f', 1) + u" dB"_q
++			: u"-- dB"_q;
++		left->update();
++	});
++	state->timer.callEach(kLevelInterval);
++
++	box->boxClosing(
++	) | rpl::on_next(save, box->lifetime());
++}
++
++} // namespace Calls::Group
+diff --git a/Telegram/SourceFiles/calls/group/calls_group_fight_mode.h b/Telegram/SourceFiles/calls/group/calls_group_fight_mode.h
+new file mode 100644
+index 0000000..6dc610d
+--- /dev/null
++++ b/Telegram/SourceFiles/calls/group/calls_group_fight_mode.h
+@@ -0,0 +1,35 @@
++/*
++This file is part of Lord Gram, an unofficial Telegram Desktop client.
++Licensed under GPLv3 with the same exceptions as Telegram Desktop.
++*/
++#pragma once
++
++#include "ui/layers/generic_box.h"
++
++#include <array>
++#include <vector>
++
++namespace Calls::Group {
++
++struct FightModeSettings {
++	bool enabled = false;
++	float gainDb = 0.f;
++	float volume = 1.f;
++	std::array<float, 6> eqDb = {};
++	float clarity = 0.f;
++	float punch = 0.f;
++	bool broadcast = false;
++
++	[[nodiscard]] std::vector<float> packed() const;
++};
++
++[[nodiscard]] FightModeSettings LoadFightModeSettings();
++void SaveFightModeSettings(const FightModeSettings &settings);
++
++[[nodiscard]] FightModeSettings &FightModeShared();
++void ApplyFightMode();
++[[nodiscard]] rpl::producer<QString> FightModeMenuLabel();
++
++void FightModeBox(not_null<Ui::GenericBox*> box);
++
++} // namespace Calls::Group
+diff --git a/Telegram/SourceFiles/main/main_domain.h b/Telegram/SourceFiles/main/main_domain.h
+index 99e2c9d..113b5ba 100644
+--- a/Telegram/SourceFiles/main/main_domain.h
++++ b/Telegram/SourceFiles/main/main_domain.h
+@@ -31,8 +31,8 @@ public:
+ 		std::unique_ptr<Account> account;
+ 	};
+ 
+-	static constexpr auto kMaxAccounts = 3;
+-	static constexpr auto kPremiumMaxAccounts = 6;
++	static constexpr auto kMaxAccounts = 20;
++	static constexpr auto kPremiumMaxAccounts = 20;
+ 
+ 	explicit Domain(const QString &dataName);
+ 	~Domain();
+diff --git a/Telegram/SourceFiles/window/window_main_menu.cpp b/Telegram/SourceFiles/window/window_main_menu.cpp
+index 89ecba3..e31c1a7 100644
+--- a/Telegram/SourceFiles/window/window_main_menu.cpp
++++ b/Telegram/SourceFiles/window/window_main_menu.cpp
+@@ -14,6 +14,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ #include "boxes/peer_list_controllers.h"
+ #include "boxes/premium_preview_box.h"
+ #include "calls/group/calls_group_common.h"
++#include "calls/group/calls_group_fight_mode.h"
+ #include "calls/calls_box_controller.h"
+ #include "calls/calls_instance.h"
+ #include "core/application.h"
+@@ -707,6 +708,12 @@ void MainMenu::setupMenu() {
+ 		)->setClickedCallback([=] {
+ 			::Calls::ShowCallsBox(controller);
+ 		});
++		addAction(
++			::Calls::Group::FightModeMenuLabel(),
++			{ &st::menuIconSoundOn }
++		)->setClickedCallback([=] {
++			controller->show(Box(::Calls::Group::FightModeBox));
++		});
+ 		addAction(
+ 			tr::lng_saved_messages(),
+ 			{ &st::menuIconSavedMessages }

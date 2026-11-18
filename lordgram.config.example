@@ -1,0 +1,5 @@
+# Copy to lordgram.config (gitignored) and fill in. Keys: https://my.telegram.org -> API development tools
+LG_PACKAGE=com.lordgram.messenger
+LG_APP_NAME=Lord Gram
+LG_API_ID=
+LG_API_HASH=
