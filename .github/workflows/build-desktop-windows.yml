@@ -56,6 +56,16 @@ jobs:
               raise SystemExit(f"Expected obsolete MSYS2 package name not found in {prepare}")
           prepare.write_text(text.replace(old, "diffutils", 1), encoding="utf-8")
           print("Replaced obsolete MSYS2 package mingw-w64-x86_64-diffutils with diffutils")
+
+          cmark = Path(os.environ["GITHUB_WORKSPACE"]) / "TBuild" / "tdesktop" / "cmake" / "external" / "cmark_gfm" / "CMakeLists.txt"
+          cmark_text = cmark.read_text(encoding="utf-8")
+          anchor = "    set(CMAKE_POLICY_VERSION_MINIMUM 3.13)\n"
+          policy = "    if(POLICY CMP0218)\n        cmake_policy(SET CMP0218 OLD)\n    endif()\n"
+          if policy not in cmark_text:
+              if anchor not in cmark_text:
+                  raise SystemExit(f"Expected cmark_gfm policy anchor not found in {cmark}")
+              cmark.write_text(cmark_text.replace(anchor, anchor + policy, 1), encoding="utf-8")
+          print("Configured cmark_gfm for CMake CMP0218 compatibility")
           PY
           DOCPATH=$GITHUB_WORKSPACE/TBuild/tdesktop/docs/building-win.md
           SDK="$(grep "SDK version" $DOCPATH | sed -r 's/.*\*\*(.*)\*\* SDK version.*/\1/')"

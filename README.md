@@ -1,61 +1,87 @@
-# Lord Gram Desktop (Windows)
+# Lord Gram Desktop
 
-Android version jaisa hi idea: **official Telegram Desktop (Qt/C++) untouched + chhoti patch layer**.
-Pinned: `telegramdesktop/tdesktop` **v6.9.4** (`8a22f2c106dd3c601e11d124b8d1894613d596fd`), tgcalls `616810f1539e3f5ee917fff42557c5eeb8b4be40`.
+Lord Gram Desktop is an unofficial Windows Telegram Desktop build with Lord Gram branding and a Fight Mode microphone DSP. The repository contains patches and build scripts; the full Telegram Desktop source is downloaded during setup.
 
-## Android se kya reuse hua, kya naya
+The current primary target is Windows desktop. The repository also contains the earlier Android patch set.
 
-| Cheez | Desktop me |
-|---|---|
-| `FightModeDsp.h` (gain, EQ, clarity, broadcast) | Same file, sidha reuse (`tests/dsp` ab bhi pass) |
-| tgcalls/audio hooks | Group calls aur 1-to-1 calls ke WebRTC capture path ke saath voice-message recording ke desktop capture path par bhi Fight Mode DSP lagta hai |
-| UI | Naya neon Qt panel (Lord Carry setup jaisa look): left side menu -> **Fight mode**. VB-Cable / device routing **nahi** hai, kyunki Telegram ke andar hi mic process hota hai |
-| Menu entry | Left side menu (hamburger) me **Fight mode** (Calls ke neeche), call ke bina bhi khulta hai. Fight mode ON ho to naam ke saath ek dot **blink** karta hai. Voice chat ke 3-dot menu me Fight mode **nahi** hai: sirf side menu se hi on/off hota hai |
-| 20 accounts | `kMaxAccounts` / `kPremiumMaxAccounts` = 20 |
-| Naam + icon | `AppName` = Lord Gram (alag data folder), icon `branding/logo.jpg` se |
-| Mic Input source switch | Nahi banaya: desktop pe Settings -> Calls me mic device pehle se hai |
+## Fight Mode
 
-Panel: left card me logo, `LORD'S GRAM`, **FIGHT MODE: ON/OFF** button aur live mic level bars. Right card **LIVE EFFECT RACK (9 controls)**:
-Gain 0-100 dB, Master output, Clarity, 6-band EQ (60 Hz se 16 kHz), aur buttons **BATTLE PRESET**, **CLEAN PRESET**, **BROADCAST ON/OFF**, **CLOSE**.
-Punch slider jaan-boojh ke nahi rakha: compressor hata diya gaya hai isliye wo kuch nahi karta. Overdrive/echo/reverb jaise controls DSP me hain hi nahi, isliye fake nahi banaye.
-Logo `branding/fightmode_logo.png` hai (badalna ho to wahi file replace karo).
-Settings `tdata/lordgram_fightmode.ini` me save hoti hain. App khulne pe Fight mode OFF hota hai; ON karne ke baad wo app band hone tak ON rehta hai aur har group voice chat pe lagta hai.
+Fight Mode processes microphone audio inside the client for:
 
-**Audio:** mic wahi device use hota hai jo Telegram Settings -> Calls me chuna hai. Fight mode ab **group voice/video chat, 1-to-1 calls, aur voice message recording** ke mic path par lagta hai. Doosri apps ki awaaz (game, music) Telegram ke andar se nahi badli ja sakti, uske liye virtual cable driver chahiye.
+- Group voice and video chats
+- One-to-one calls
+- Voice-message recording
 
-## UI (patch 0003)
+It does not process audio from other applications. A virtual audio cable would be required for games or music.
 
-- Left folder bar (All Chats, Unread, ... Edit) ke bilkul neeche **gol Fight mode button** (logo + `FIGHT` / `FIGHT ON`). Tap = Fight mode panel. ON ho to laal ring blink karti hai.
-- Koi chat select na ho to centre me **rounded card**: Lord Gram logo + "Select a chat to start messaging" + "Your messages will appear here".
-- Abhi baaki: dark blue/green theme aur left folder bar ko default ON karna (ye alag step hai, abhi nahi hua).
+The desktop panel is available from the left menu under **Fight mode**. It provides gain, master volume, clarity, six-band EQ, Battle/Clean presets, Broadcast mode, and a live microphone level display. Settings are stored in `tdata/lordgram_fightmode.ini`.
 
-## Build (GitHub Actions, recommended)
+Fight Mode starts disabled when the application launches. High gain can clip or distort audio because the requested DSP chain has no compressor or limiter. Use a headset to prevent feedback.
 
-1. Is repo ko GitHub pe push karo (**Public** rakho, GPLv3 ke liye bhi zaroori).
-2. Secrets: `LG_API_ID`, `LG_API_HASH` (my.telegram.org), optional `LG_APP_NAME`.
-3. *Actions -> Build Lord Gram Desktop (Windows x64) -> Run workflow*.
-4. Artifact `LordGram-Windows-x64` -> `Telegram.exe`. Pehli run me dependencies (Qt, ffmpeg, webrtc...) banti hain: **kai ghante** lag sakte hain, GitHub ki 6 ghante ki limit ke paas. Agar timeout ho to bas dobara run karo: cache se aage badhta hai.
+## Windows build with GitHub Actions
 
-Workflow upstream ke `win.yml` jaisa hai, sirf x64 + Qt6, auto-update band, crash reports band.
-Ye **Debug** build hai (upstream ki CI jaisa; Release libraries aur zyada time/disk leti hain). Exe bada hoga, par chalega.
+GitHub Actions is recommended because the first build downloads Qt, FFmpeg, WebRTC, MSVC-related dependencies, and MSYS2 packages and may take several hours.
 
-Local build: `desktop/scripts/setup_desktop.sh` source ready karta hai, phir Telegram ka `docs/building-win.md` follow karo (Visual Studio 2022, ~40 GB).
+1. Push this repository to GitHub.
+2. Add these repository secrets under **Settings → Secrets and variables → Actions**:
+   - `LG_API_ID`: numeric Telegram API ID
+   - `LG_API_HASH`: Telegram API hash
+   - `LG_APP_NAME`: optional; defaults to `Lord Gram`
+3. Run **Actions → Build Lord Gram Desktop (Windows x64)**.
+4. Download `Telegram.exe` from the `LordGram-Windows-x64` artifact.
 
-## Status
+The workflow builds pinned Telegram Desktop v6.9.4 as an x64 Qt6 Debug build, applies Lord Gram patches/assets, and disables auto-update and crash reports. It also replaces the obsolete MSYS2 package `mingw-w64-x86_64-diffutils` with `diffutils` and applies a CMake CMP0218 compatibility fix for the pinned `cmark_gfm` dependency.
 
-| Cheez | Status |
-|---|---|
-| Patches pinned v6.9.4 pe `git apply --check` | Pass |
-| DSP unit tests | Pass |
-| Pura pipeline (patches + logo qrc + rebrand) saaf pinned copy pe | Pass |
-| C++/Qt code compile aur panel ka asli look | **Verify nahi hua**: Qt/MSVC toolchain yahan nahi tha. Pehli CI run me compile error aaye to log ke `error C` lines bhejo, fix kar dunga |
-| Fight mode ka asli audio asar | **Verify nahi hua**, 2 PC pe call me test karna hoga |
-| 20 accounts | **Verify nahi hua** |
-| Windows installer/updater | Nahi, sirf `Telegram.exe` |
+See [desktop/DESKTOP.md](desktop/DESKTOP.md) for the complete desktop feature list and limitations.
 
-## Safety / limitations
+## Local setup
 
-- Android jaisa hi: compressor/limiter nahi hai, **~20 dB se upar gain clip/distort** karta hai. Box me warning bhi hai.
-- Speaker se feedback hota hai: **headset use karo**.
-- Push notifications desktop pe normal chalti hain (Firebase nahi lagta).
-- Unofficial client hai. Telegram Desktop **GPLv3** hai: source public rakho, `LICENSE` add karo, sirf apni `api_id/hash` use karo.
+Local Windows compilation requires Git Bash, Python 3 with Pillow, Visual Studio with the C++ workload, the Windows SDK, CMake, NuGet, and substantial disk space.
+
+```bash
+python -m pip install pillow
+bash desktop/scripts/setup_desktop.sh
+```
+
+The setup script downloads the pinned source, applies patches, installs the Fight Mode asset, and generates icons. The final native build must run from a Visual Studio developer environment using Telegram Desktop's Windows build instructions.
+
+## Configuration and secrets
+
+For local setup, copy `lordgram.config.example` to `lordgram.config`:
+
+```ini
+LG_PACKAGE=com.lordgram.messenger
+LG_APP_NAME=Lord Gram
+LG_API_ID=12345678
+LG_API_HASH=replace_with_your_api_hash
+```
+
+`lordgram.config` is ignored by Git. Line 4, `LG_API_HASH`, is a private Telegram credential. Never publish it in the README, a patch, a commit, or an issue. GitHub Actions uses repository secrets instead of this local file.
+
+Use only API credentials created for your own application and follow Telegram's terms.
+
+## Repository layout
+
+```text
+desktop/
+  DESKTOP.md
+  patches/
+  scripts/setup_desktop.sh
+  scripts/enable_fightmode_all_audio.py
+.github/workflows/build-desktop-windows.yml
+branding/
+tests/dsp/
+lordgram.config.example
+```
+
+## Testing and status
+
+The DSP can be tested without WebRTC:
+
+```bash
+bash tests/dsp/run.sh
+```
+
+The source preparation pipeline and Python setup helpers have been validated. A complete C++/Qt build and live audio behavior require the Windows toolchain and real call/recording tests.
+
+Telegram Desktop is GPLv3. Keep source and patch changes available when distributing binaries.
